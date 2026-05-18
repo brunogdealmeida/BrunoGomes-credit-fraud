@@ -5,6 +5,8 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends wget && \
     rm -rf /var/lib/apt/lists/*
 
+RUN pip install --no-cache-dir pyyaml==6.0.2
+
 ARG ICEBERG_VERSION=1.5.2
 ARG NESSIE_VERSION=0.76.6
 ARG HADOOP_AWS_VERSION=3.3.4
