@@ -1,5 +1,7 @@
 """Silver layer: validate Bronze data, write clean records to Silver and rejects to Quarantine."""
 
+from __future__ import annotations
+
 import logging
 import os
 import sys
