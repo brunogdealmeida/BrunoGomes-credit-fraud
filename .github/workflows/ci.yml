@@ -40,8 +40,8 @@ jobs:
 
 # ── Job 2: Integration Tests ──────────────────────────────────────────────────
 # Runs only on push to main or manual dispatch.
-# Spins up MinIO + Nessie + Dremio, executes the full pipeline via Spark local
-# mode, then runs the integration test suite against the live services.
+# Spins up MinIO + Nessie, executes the full pipeline via Spark local mode,
+# then runs the integration test suite via PyIceberg (no Dremio needed).
 
   integration-tests:
     name: Integration Tests
@@ -56,8 +56,6 @@ jobs:
     env:
       MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
       MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
-      DREMIO_USERNAME: ${{ secrets.DREMIO_USERNAME }}
-      DREMIO_PASSWORD: ${{ secrets.DREMIO_PASSWORD }}
 
     steps:
       - uses: actions/checkout@v4
@@ -70,8 +68,6 @@ jobs:
           missing=""
           [ -z "$MINIO_ROOT_USER" ]     && missing="$missing MINIO_ROOT_USER"
           [ -z "$MINIO_ROOT_PASSWORD" ] && missing="$missing MINIO_ROOT_PASSWORD"
-          [ -z "$DREMIO_USERNAME" ]     && missing="$missing DREMIO_USERNAME"
-          [ -z "$DREMIO_PASSWORD" ]     && missing="$missing DREMIO_PASSWORD"
           if [ -n "$missing" ]; then
             echo "ERROR: Missing GitHub repository secrets:$missing"
             echo "Add them at: GitHub repo → Settings → Secrets and variables → Actions → New repository secret"
@@ -80,15 +76,15 @@ jobs:
 
       # ── Credentials ───────────────────────────────────────────────────────
       # Write .env so docker compose can resolve all ${VAR} references.
-      # Non-critical services (Airflow, Superset) get dummy values since they
-      # are not started in CI.
+      # Non-critical services (Airflow, Superset, Dremio) get dummy values
+      # since they are not started in CI.
       - name: Create .env
         run: |
           cat > .env <<EOF
           MINIO_ROOT_USER=${MINIO_ROOT_USER}
           MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
-          DREMIO_USERNAME=${DREMIO_USERNAME}
-          DREMIO_PASSWORD=${DREMIO_PASSWORD}
+          DREMIO_USERNAME=admin
+          DREMIO_PASSWORD=admin
           NESSIE_URI=http://nessie:19120/api/v1
           NESSIE_URI_V2=http://nessie:19120/api/v2
           MINIO_ENDPOINT=http://minio:9000
@@ -110,8 +106,8 @@ jobs:
           sed -i 's/^ *//' .env
 
       # ── Infrastructure ────────────────────────────────────────────────────
-      - name: Start MinIO, Nessie, Dremio
-        run: docker compose up -d minio nessie dremio
+      - name: Start MinIO and Nessie
+        run: docker compose up -d minio nessie
 
       - name: Build Spark image
         run: docker build -t lakehouse-spark ./spark
@@ -129,13 +125,6 @@ jobs:
 
       - name: Create MinIO bucket
         run: docker compose run --rm minio-init
-
-      # Dremio takes 3-6 min on its first boot (JVM warm-up + schema init).
-      - name: Wait for Dremio
-        run: |
-          timeout 420 bash -c \
-            'until curl -sf http://localhost:9047 > /dev/null; do sleep 10; done'
-          echo "Dremio is up"
 
       # ── Run pipeline ──────────────────────────────────────────────────────
       # Each job runs in the built Spark image with --master local[2] so no
@@ -196,15 +185,6 @@ jobs:
               --py-files /opt/spark/jobs/config.py \
               /opt/spark/jobs/gold_aggregation.py \
               df_fraud_credit.csv
-
-      # ── Register Nessie source in Dremio ──────────────────────────────────
-      - name: Dremio setup (register Nessie + MinIO source)
-        run: |
-          for attempt in 1 2 3; do
-            docker compose run --rm dremio-setup && break
-            echo "dremio-setup attempt $attempt failed — retrying in 30 s…"
-            sleep 30
-          done
 
       # ── Integration tests ─────────────────────────────────────────────────
       # Tests run on the host and connect to services via exposed localhost ports.

@@ -1,16 +1,13 @@
 """
 Integration tests for the fraud lakehouse pipeline.
 
-Requires a running Docker stack (minio, nessie, dremio).
+Requires a running Docker stack (minio, nessie).
 Run with: pytest tests/integration -m integration
 """
 
 import pytest
 
 TABLE = "tb_fraud_credit"
-BRONZE_SQL    = f"SELECT COUNT(*) AS cnt FROM nessie_lakehouse.bronze.{TABLE}"
-SILVER_SQL    = f"SELECT COUNT(*) AS cnt FROM nessie_lakehouse.silver.{TABLE}"
-QUARANTINE_SQL = f"SELECT COUNT(*) AS cnt FROM nessie_lakehouse.quarantine.{TABLE}"
 
 
 # ── Nessie namespace + table existence ────────────────────────────────────────
@@ -71,32 +68,32 @@ def test_minio_layer_has_objects(minio, prefix):
     assert response.get("KeyCount", 0) > 0, f"No objects found under s3://lakehouse/{prefix}"
 
 
-# ── Row counts via Dremio SQL ─────────────────────────────────────────────────
+# ── Row counts via PyIceberg ──────────────────────────────────────────────────
 
 @pytest.mark.integration
-def test_bronze_row_count_positive(dremio):
-    count = int(dremio.scalar(BRONZE_SQL))
+def test_bronze_row_count_positive(catalog):
+    count = catalog.load_table(("bronze", TABLE)).scan().count_rows()
     assert count > 0, "Bronze table is empty"
 
 
 @pytest.mark.integration
-def test_silver_row_count_positive(dremio):
-    count = int(dremio.scalar(SILVER_SQL))
+def test_silver_row_count_positive(catalog):
+    count = catalog.load_table(("silver", TABLE)).scan().count_rows()
     assert count > 0, "Silver table is empty"
 
 
 @pytest.mark.integration
-def test_quarantine_row_count_positive(dremio):
-    count = int(dremio.scalar(QUARANTINE_SQL))
+def test_quarantine_row_count_positive(catalog):
+    count = catalog.load_table(("quarantine", TABLE)).scan().count_rows()
     assert count > 0, "Quarantine table is empty"
 
 
 @pytest.mark.integration
-def test_silver_plus_quarantine_equals_bronze(dremio):
+def test_silver_plus_quarantine_equals_bronze(catalog):
     """Every bronze row must land in either silver or quarantine."""
-    bronze    = int(dremio.scalar(BRONZE_SQL))
-    silver    = int(dremio.scalar(SILVER_SQL))
-    quarantine = int(dremio.scalar(QUARANTINE_SQL))
+    bronze     = catalog.load_table(("bronze",     TABLE)).scan().count_rows()
+    silver     = catalog.load_table(("silver",     TABLE)).scan().count_rows()
+    quarantine = catalog.load_table(("quarantine", TABLE)).scan().count_rows()
     assert silver + quarantine == bronze, (
         f"Row count mismatch: bronze={bronze}, silver={silver}, quarantine={quarantine}, "
         f"diff={bronze - (silver + quarantine)}"
@@ -111,82 +108,60 @@ def test_silver_plus_quarantine_equals_bronze(dremio):
     "high_risk_transactions",
     "risk_profile",
 ])
-def test_gold_table_row_count_positive(dremio, gold_table):
-    count = int(dremio.scalar(f"SELECT COUNT(*) AS cnt FROM nessie_lakehouse.gold.{gold_table}"))
+def test_gold_table_row_count_positive(catalog, gold_table):
+    count = catalog.load_table(("gold", gold_table)).scan().count_rows()
     assert count > 0, f"Gold table '{gold_table}' is empty"
 
 
 # ── Silver data quality ───────────────────────────────────────────────────────
 
 @pytest.mark.integration
-def test_silver_no_null_amounts(dremio):
-    null_count = int(dremio.scalar(
-        f"SELECT COUNT(*) AS cnt FROM nessie_lakehouse.silver.{TABLE} WHERE amount IS NULL"
-    ))
-    assert null_count == 0
+def test_silver_no_null_amounts(silver_df):
+    assert silver_df["amount"].isna().sum() == 0
 
 
 @pytest.mark.integration
-def test_silver_no_negative_amounts(dremio):
-    neg_count = int(dremio.scalar(
-        f"SELECT COUNT(*) AS cnt FROM nessie_lakehouse.silver.{TABLE} WHERE amount <= 0"
-    ))
-    assert neg_count == 0
+def test_silver_no_negative_amounts(silver_df):
+    assert (silver_df["amount"] <= 0).sum() == 0
 
 
 @pytest.mark.integration
-def test_silver_risk_score_in_range(dremio):
-    out_of_range = int(dremio.scalar(
-        f"SELECT COUNT(*) AS cnt FROM nessie_lakehouse.silver.{TABLE} "
-        f"WHERE risk_score < 0 OR risk_score > 100"
-    ))
+def test_silver_risk_score_in_range(silver_df):
+    out_of_range = ((silver_df["risk_score"] < 0) | (silver_df["risk_score"] > 100)).sum()
     assert out_of_range == 0
 
 
 @pytest.mark.integration
-def test_silver_amount_tier_values(dremio):
-    rows = dremio.query(
-        f"SELECT DISTINCT amount_tier FROM nessie_lakehouse.silver.{TABLE}"
-    )
-    tiers = {r["amount_tier"] for r in rows}
+def test_silver_amount_tier_values(silver_df):
+    tiers = set(silver_df["amount_tier"].dropna().unique())
     assert tiers <= {"micro", "small", "medium", "large"}
 
 
 @pytest.mark.integration
-def test_silver_is_fraudulent_only_for_phishing_scam(dremio):
-    wrong = int(dremio.scalar(
-        f"SELECT COUNT(*) AS cnt FROM nessie_lakehouse.silver.{TABLE} "
-        f"WHERE is_fraudulent = TRUE AND transaction_type NOT IN ('phishing', 'scam')"
-    ))
-    assert wrong == 0
+def test_silver_is_fraudulent_only_for_phishing_scam(silver_df):
+    wrong = silver_df[
+        (silver_df["is_fraudulent"] == True) &
+        (~silver_df["transaction_type"].isin(["phishing", "scam"]))
+    ]
+    assert len(wrong) == 0
 
 
 @pytest.mark.integration
-def test_silver_valid_regions_only(dremio):
-    rows = dremio.query(
-        f"SELECT DISTINCT location_region FROM nessie_lakehouse.silver.{TABLE}"
-    )
-    regions = {r["location_region"] for r in rows}
+def test_silver_valid_regions_only(silver_df):
+    regions = set(silver_df["location_region"].dropna().unique())
     assert regions <= {"Africa", "Asia", "Europe", "North America", "South America"}
 
 
 # ── Quarantine data quality ───────────────────────────────────────────────────
 
 @pytest.mark.integration
-def test_quarantine_rejection_reason_never_null(dremio):
-    null_count = int(dremio.scalar(
-        f"SELECT COUNT(*) AS cnt FROM nessie_lakehouse.quarantine.{TABLE} "
-        f"WHERE _rejection_reason IS NULL"
-    ))
-    assert null_count == 0
+def test_quarantine_rejection_reason_never_null(quarantine_df):
+    assert quarantine_df["_rejection_reason"].isna().sum() == 0
 
 
 @pytest.mark.integration
-def test_quarantine_rejection_reasons_are_known(dremio):
-    rows = dremio.query(
-        f"SELECT DISTINCT _rejection_reason FROM nessie_lakehouse.quarantine.{TABLE}"
-    )
-    reasons = {r["_rejection_reason"] for r in rows}
+def test_quarantine_rejection_reasons_are_known(quarantine_df):
+    reasons = set(quarantine_df["_rejection_reason"].dropna().unique())
     known = {"invalid_amount", "invalid_region", "invalid_anomaly",
              "invalid_transaction_type", "invalid_risk_score", "other"}
     unknown = reasons - known
@@ -194,9 +169,5 @@ def test_quarantine_rejection_reasons_are_known(dremio):
 
 
 @pytest.mark.integration
-def test_quarantine_timestamp_never_null(dremio):
-    null_count = int(dremio.scalar(
-        f"SELECT COUNT(*) AS cnt FROM nessie_lakehouse.quarantine.{TABLE} "
-        f"WHERE _quarantine_time IS NULL"
-    ))
-    assert null_count == 0
+def test_quarantine_timestamp_never_null(quarantine_df):
+    assert quarantine_df["_quarantine_time"].isna().sum() == 0
