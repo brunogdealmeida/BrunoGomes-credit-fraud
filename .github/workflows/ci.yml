@@ -64,6 +64,20 @@ jobs:
         with:
           lfs: true  # download actual CSV, not the LFS pointer
 
+      # ── Validate secrets ──────────────────────────────────────────────────
+      - name: Validate required secrets
+        run: |
+          missing=""
+          [ -z "$MINIO_ROOT_USER" ]     && missing="$missing MINIO_ROOT_USER"
+          [ -z "$MINIO_ROOT_PASSWORD" ] && missing="$missing MINIO_ROOT_PASSWORD"
+          [ -z "$DREMIO_USERNAME" ]     && missing="$missing DREMIO_USERNAME"
+          [ -z "$DREMIO_PASSWORD" ]     && missing="$missing DREMIO_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "ERROR: Missing GitHub repository secrets:$missing"
+            echo "Add them at: GitHub repo → Settings → Secrets and variables → Actions → New repository secret"
+            exit 1
+          fi
+
       # ── Credentials ───────────────────────────────────────────────────────
       # Write .env so docker compose can resolve all ${VAR} references.
       # Non-critical services (Airflow, Superset) get dummy values since they
