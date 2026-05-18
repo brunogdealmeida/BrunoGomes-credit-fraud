@@ -51,19 +51,24 @@ jobs:
       github.ref == 'refs/heads/main' ||
       github.event_name == 'workflow_dispatch'
 
+    # Make secrets available as env vars for every step in this job.
+    # Docker run steps use bare  -e KEY  (no =value) to inherit from here.
+    env:
+      MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
+      MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
+      DREMIO_USERNAME: ${{ secrets.DREMIO_USERNAME }}
+      DREMIO_PASSWORD: ${{ secrets.DREMIO_PASSWORD }}
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true  # download actual CSV, not the LFS pointer
 
       # ── Credentials ───────────────────────────────────────────────────────
       # Write .env so docker compose can resolve all ${VAR} references.
       # Non-critical services (Airflow, Superset) get dummy values since they
       # are not started in CI.
       - name: Create .env
-        env:
-          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
-          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
-          DREMIO_USERNAME: ${{ secrets.DREMIO_USERNAME }}
-          DREMIO_PASSWORD: ${{ secrets.DREMIO_PASSWORD }}
         run: |
           cat > .env <<EOF
           MINIO_ROOT_USER=${MINIO_ROOT_USER}
@@ -123,16 +128,13 @@ jobs:
       # cluster is needed. The container joins lakehouse-net to reach MinIO and
       # Nessie by their container hostnames.
       - name: Pipeline — Bronze ingestion
-        env:
-          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
-          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
         run: |
           docker run --rm \
             --network lakehouse-net \
             -e NESSIE_URI=http://nessie:19120/api/v1 \
             -e MINIO_ENDPOINT=http://minio:9000 \
-            -e MINIO_ROOT_USER="${MINIO_ROOT_USER}" \
-            -e MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD}" \
+            -e MINIO_ROOT_USER \
+            -e MINIO_ROOT_PASSWORD \
             -e DATASET_DIR=/dataset \
             -v "$PWD/spark/jobs:/opt/spark/jobs:ro" \
             -v "$PWD/dataset:/dataset:ro" \
@@ -146,16 +148,13 @@ jobs:
               df_fraud_credit.csv
 
       - name: Pipeline — Silver transformation
-        env:
-          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
-          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
         run: |
           docker run --rm \
             --network lakehouse-net \
             -e NESSIE_URI=http://nessie:19120/api/v1 \
             -e MINIO_ENDPOINT=http://minio:9000 \
-            -e MINIO_ROOT_USER="${MINIO_ROOT_USER}" \
-            -e MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD}" \
+            -e MINIO_ROOT_USER \
+            -e MINIO_ROOT_PASSWORD \
             -v "$PWD/spark/jobs:/opt/spark/jobs:ro" \
             lakehouse-spark \
             /opt/spark/bin/spark-submit \
@@ -167,16 +166,13 @@ jobs:
               df_fraud_credit.csv
 
       - name: Pipeline — Gold aggregation
-        env:
-          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
-          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
         run: |
           docker run --rm \
             --network lakehouse-net \
             -e NESSIE_URI=http://nessie:19120/api/v1 \
             -e MINIO_ENDPOINT=http://minio:9000 \
-            -e MINIO_ROOT_USER="${MINIO_ROOT_USER}" \
-            -e MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD}" \
+            -e MINIO_ROOT_USER \
+            -e MINIO_ROOT_PASSWORD \
             -v "$PWD/spark/jobs:/opt/spark/jobs:ro" \
             lakehouse-spark \
             /opt/spark/bin/spark-submit \
@@ -203,11 +199,6 @@ jobs:
         run: pip install -r requirements-test.txt
 
       - name: Run integration tests
-        env:
-          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
-          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
-          DREMIO_USERNAME: ${{ secrets.DREMIO_USERNAME }}
-          DREMIO_PASSWORD: ${{ secrets.DREMIO_PASSWORD }}
         run: python -m pytest tests/integration -m integration --tb=short
 
       # ── Cleanup ───────────────────────────────────────────────────────────
