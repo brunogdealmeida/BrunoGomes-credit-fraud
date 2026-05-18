@@ -134,7 +134,7 @@ The `dremio-setup` service automatically configures the Nessie source on first s
 
 If it fails, add it manually in the Dremio UI:
 - **Add Source → Nessie**
-- Endpoint: `http://nessie:19120/api/v1`
+- Endpoint: `http://nessie:19120/api/v2`
 - Auth: None
 - Storage: S3-compatible → `http://minio:9000`
 - Access key: `admin` / Secret: `password123`
