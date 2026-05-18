@@ -1,0 +1,46 @@
+version: 2
+
+models:
+  - name: fraud_by_region
+    description: >
+      Aggregated fraud transaction counts, volumes, and risk scores by region
+      and anomaly label. Primary source for regional breakdown charts.
+    columns:
+      - name: location_region
+        tests: [not_null]
+      - name: anomaly
+        tests: [not_null]
+      - name: transaction_count
+        tests: [not_null]
+
+  - name: fraud_by_type
+    description: >
+      Transaction stats grouped by type (purchase/sale/transfer/phishing/scam),
+      anomaly classification, and purchase pattern.
+    columns:
+      - name: transaction_type
+        tests: [not_null]
+      - name: transaction_count
+        tests: [not_null]
+
+  - name: daily_fraud_metrics
+    description: >
+      Daily transaction volume and risk distribution per region.
+      Powers time-series charts.
+    columns:
+      - name: transaction_date
+        tests: [not_null]
+      - name: total_transactions
+        tests: [not_null]
+
+  - name: high_risk_transactions
+    description: >
+      Individual transactions where anomaly = high_risk OR risk_score >= 75.
+      Used for the transactions detail table.
+    columns:
+      - name: transaction_datetime
+        tests: [not_null]
+      - name: amount
+        tests: [not_null]
+      - name: risk_score
+        tests: [not_null]

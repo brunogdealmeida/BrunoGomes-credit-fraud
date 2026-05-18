@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+airflow/logs/
+*.egg-info/
+.idea/
+.vscode/
+.claude/

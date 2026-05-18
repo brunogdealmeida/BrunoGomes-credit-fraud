@@ -1,0 +1,216 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Job 1: Unit Tests ─────────────────────────────────────────────────────────
+# Runs on every push and PR. No external dependencies.
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up Java (required by PySpark)
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+
+      - name: Run unit tests
+        run: python -m pytest tests/unit -m unit --tb=short
+
+# ── Job 2: Integration Tests ──────────────────────────────────────────────────
+# Runs only on push to main or manual dispatch.
+# Spins up MinIO + Nessie + Dremio, executes the full pipeline via Spark local
+# mode, then runs the integration test suite against the live services.
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    if: |
+      github.ref == 'refs/heads/main' ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Credentials ───────────────────────────────────────────────────────
+      # Write .env so docker compose can resolve all ${VAR} references.
+      # Non-critical services (Airflow, Superset) get dummy values since they
+      # are not started in CI.
+      - name: Create .env
+        env:
+          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
+          DREMIO_USERNAME: ${{ secrets.DREMIO_USERNAME }}
+          DREMIO_PASSWORD: ${{ secrets.DREMIO_PASSWORD }}
+        run: |
+          cat > .env <<EOF
+          MINIO_ROOT_USER=${MINIO_ROOT_USER}
+          MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+          DREMIO_USERNAME=${DREMIO_USERNAME}
+          DREMIO_PASSWORD=${DREMIO_PASSWORD}
+          NESSIE_URI=http://nessie:19120/api/v1
+          NESSIE_URI_V2=http://nessie:19120/api/v2
+          MINIO_ENDPOINT=http://minio:9000
+          SPARK_MASTER_URL=spark://spark-master:7077
+          POSTGRES_USER=airflow
+          POSTGRES_PASSWORD=airflow
+          POSTGRES_DB=airflow
+          AIRFLOW__CORE__FERNET_KEY=Ej-6xqvVJe1nDXoFWo7_FWs_kcPzKk23jTKkO7wAAA=
+          AIRFLOW__WEBSERVER__SECRET_KEY=ci-secret
+          AIRFLOW__CORE__LOAD_EXAMPLES=False
+          AIRFLOW_ADMIN_USERNAME=admin
+          AIRFLOW_ADMIN_PASSWORD=admin
+          SUPERSET_SECRET_KEY=ci-superset-secret
+          SUPERSET_ADMIN_USERNAME=admin
+          SUPERSET_ADMIN_PASSWORD=admin
+          SUPERSET_ADMIN_EMAIL=admin@example.com
+          EOF
+          # Strip leading spaces introduced by YAML indentation
+          sed -i 's/^ *//' .env
+
+      # ── Infrastructure ────────────────────────────────────────────────────
+      - name: Start MinIO, Nessie, Dremio
+        run: docker compose up -d minio nessie dremio
+
+      - name: Build Spark image
+        run: docker build -t lakehouse-spark ./spark
+
+      # ── Wait for services ─────────────────────────────────────────────────
+      - name: Wait for MinIO
+        run: |
+          timeout 60 bash -c \
+            'until curl -sf http://localhost:9000/minio/health/live; do sleep 3; done'
+
+      - name: Wait for Nessie
+        run: |
+          timeout 60 bash -c \
+            'until curl -sf http://localhost:19120/api/v1/config; do sleep 3; done'
+
+      - name: Create MinIO bucket
+        run: docker compose run --rm minio-init
+
+      # Dremio takes 3-6 min on its first boot (JVM warm-up + schema init).
+      - name: Wait for Dremio
+        run: |
+          timeout 420 bash -c \
+            'until curl -sf http://localhost:9047 > /dev/null; do sleep 10; done'
+          echo "Dremio is up"
+
+      # ── Run pipeline ──────────────────────────────────────────────────────
+      # Each job runs in the built Spark image with --master local[2] so no
+      # cluster is needed. The container joins lakehouse-net to reach MinIO and
+      # Nessie by their container hostnames.
+      - name: Pipeline — Bronze ingestion
+        env:
+          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
+        run: |
+          docker run --rm \
+            --network lakehouse-net \
+            -e NESSIE_URI=http://nessie:19120/api/v1 \
+            -e MINIO_ENDPOINT=http://minio:9000 \
+            -e MINIO_ROOT_USER="${MINIO_ROOT_USER}" \
+            -e MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD}" \
+            -e DATASET_DIR=/dataset \
+            -v "$PWD/spark/jobs:/opt/spark/jobs:ro" \
+            -v "$PWD/dataset:/dataset:ro" \
+            lakehouse-spark \
+            /opt/spark/bin/spark-submit \
+              --master "local[2]" \
+              --driver-memory 1g \
+              --conf spark.sql.shuffle.partitions=4 \
+              --py-files /opt/spark/jobs/config.py \
+              /opt/spark/jobs/bronze_ingestion.py \
+              df_fraud_credit.csv
+
+      - name: Pipeline — Silver transformation
+        env:
+          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
+        run: |
+          docker run --rm \
+            --network lakehouse-net \
+            -e NESSIE_URI=http://nessie:19120/api/v1 \
+            -e MINIO_ENDPOINT=http://minio:9000 \
+            -e MINIO_ROOT_USER="${MINIO_ROOT_USER}" \
+            -e MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD}" \
+            -v "$PWD/spark/jobs:/opt/spark/jobs:ro" \
+            lakehouse-spark \
+            /opt/spark/bin/spark-submit \
+              --master "local[2]" \
+              --driver-memory 1g \
+              --conf spark.sql.shuffle.partitions=4 \
+              --py-files /opt/spark/jobs/config.py \
+              /opt/spark/jobs/silver_transformation.py \
+              df_fraud_credit.csv
+
+      - name: Pipeline — Gold aggregation
+        env:
+          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
+        run: |
+          docker run --rm \
+            --network lakehouse-net \
+            -e NESSIE_URI=http://nessie:19120/api/v1 \
+            -e MINIO_ENDPOINT=http://minio:9000 \
+            -e MINIO_ROOT_USER="${MINIO_ROOT_USER}" \
+            -e MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD}" \
+            -v "$PWD/spark/jobs:/opt/spark/jobs:ro" \
+            lakehouse-spark \
+            /opt/spark/bin/spark-submit \
+              --master "local[2]" \
+              --driver-memory 1g \
+              --conf spark.sql.shuffle.partitions=4 \
+              --py-files /opt/spark/jobs/config.py \
+              /opt/spark/jobs/gold_aggregation.py \
+              df_fraud_credit.csv
+
+      # ── Register Nessie source in Dremio ──────────────────────────────────
+      - name: Dremio setup (register Nessie + MinIO source)
+        run: docker compose run --rm dremio-setup
+
+      # ── Integration tests ─────────────────────────────────────────────────
+      # Tests run on the host and connect to services via exposed localhost ports.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+
+      - name: Run integration tests
+        env:
+          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
+          DREMIO_USERNAME: ${{ secrets.DREMIO_USERNAME }}
+          DREMIO_PASSWORD: ${{ secrets.DREMIO_PASSWORD }}
+        run: python -m pytest tests/integration -m integration --tb=short
+
+      # ── Cleanup ───────────────────────────────────────────────────────────
+      - name: Tear down Docker services
+        if: always()
+        run: docker compose down -v --remove-orphans

@@ -1,0 +1,182 @@
+files:
+  df_fraud_credit.csv:
+    table: tb_fraud_credit
+
+    schema:
+      - name: timestamp
+        type: integer
+        nullable: false
+
+      - name: sending_address
+        type: string
+        nullable: false
+
+      - name: receiving_address
+        type: string
+        nullable: false
+
+      - name: amount
+        type: decimal
+        precision: 18
+        scale: 2
+        nullable: false
+
+      - name: transaction_type
+        type: string
+        nullable: false
+
+      - name: location_region
+        type: string
+        nullable: false
+
+      - name: ip_prefix
+        type: string
+        nullable: false
+
+      - name: login_frequency
+        type: integer
+        nullable: false
+
+      - name: session_duration
+        type: integer
+        nullable: false
+
+      - name: purchase_pattern
+        type: string
+        nullable: false
+
+      - name: age_group
+        type: string
+        nullable: false
+
+      - name: risk_score
+        type: double
+        nullable: false
+
+      - name: anomaly
+        type: string
+        nullable: false
+
+    validation:
+      valid_regions:
+        - Africa
+        - Asia
+        - Europe
+        - North America
+        - South America
+      valid_anomalies:
+        - low_risk
+        - moderate_risk
+        - high_risk
+      valid_transaction_types:
+        - purchase
+        - sale
+        - transfer
+        - phishing
+        - scam
+
+    silver:
+      enrichment:
+        - column: transaction_datetime
+          transform: to_timestamp
+          source: timestamp
+          source_cast: long
+
+        - column: transaction_date
+          transform: to_date
+          source: timestamp
+          source_cast: long
+
+        - column: amount
+          transform: cast
+          source: amount
+          type: double
+
+        - column: risk_score
+          transform: cast
+          source: risk_score
+          type: double
+
+        - column: login_frequency
+          transform: cast
+          source: login_frequency
+          type: int
+
+        - column: session_duration
+          transform: cast
+          source: session_duration
+          type: int
+
+        - column: is_fraudulent
+          transform: isin
+          source: transaction_type
+          values: [phishing, scam]
+
+        - column: is_high_risk
+          transform: threshold
+          source: risk_score
+          operator: ">="
+          value: 75.0
+
+        - column: amount_tier
+          transform: buckets
+          source: amount
+          buckets:
+            - label: micro
+              max: 1000
+            - label: small
+              max: 10000
+            - label: medium
+              max: 50000
+            - label: large
+              otherwise: true
+
+        - column: _processing_time
+          transform: current_timestamp
+
+      quarantine:
+        rejection_column: _rejection_reason
+        timestamp_column: _quarantine_time
+        rules:
+          - reason: invalid_amount
+            condition:
+              type: null_or_threshold
+              column: amount
+              operator: "<="
+              value: 0.0
+
+          - reason: invalid_region
+            condition:
+              type: not_in
+              column: location_region
+              values_ref: valid_regions
+
+          - reason: invalid_anomaly
+            condition:
+              type: not_in
+              column: anomaly
+              values_ref: valid_anomalies
+
+          - reason: invalid_transaction_type
+            condition:
+              type: not_in
+              column: transaction_type
+              values_ref: valid_transaction_types
+
+          - reason: invalid_risk_score
+            condition:
+              type: null_or_range
+              column: risk_score
+              min: 0.0
+              max: 100.0
+
+    rename_columns: {}
+
+    partition_by: []
+
+    sort_order: location_region
+
+    drop_columns: []
+
+    cast_columns:
+      timestamp: timestamp

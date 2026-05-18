@@ -1,0 +1,325 @@
+version: "3.8"
+
+x-spark-common-env: &spark-common-env
+  MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+  MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+  NESSIE_URI: ${NESSIE_URI}
+  MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+  SPARK_MASTER_URL: ${SPARK_MASTER_URL}
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW__CORE__LOAD_EXAMPLES}
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type":"spark","host":"spark://spark-master:7077"}'
+    <<: *spark-common-env
+    DREMIO_USERNAME: ${DREMIO_USERNAME}
+    DREMIO_PASSWORD: ${DREMIO_PASSWORD}
+    SPARK_HOME: /opt/spark
+    JAVA_HOME: /opt/java/openjdk
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./spark/jobs:/opt/airflow/jobs
+    - ./dbt:/opt/dbt
+    - ./dataset:/opt/spark/dataset:ro
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - lakehouse-net
+
+services:
+
+  # ─── Object Storage ──────────────────────────────────────────────────────────
+
+  minio:
+    image: minio/minio:RELEASE.2024-03-21T23-13-43Z
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - lakehouse-net
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: |
+      /bin/sh -c "
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}
+        mc mb --ignore-existing local/lakehouse
+        echo 'MinIO bucket [lakehouse] ready'
+      "
+    networks:
+      - lakehouse-net
+
+  # ─── Iceberg Catalog (Nessie) ─────────────────────────────────────────────────
+
+  nessie:
+    image: projectnessie/nessie:0.76.6
+    container_name: nessie
+    ports:
+      - "19120:19120"
+    environment:
+      QUARKUS_HTTP_PORT: 19120
+      NESSIE_VERSION_STORE_TYPE: IN_MEMORY
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:19120/api/v1/config"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - lakehouse-net
+
+  # ─── Metadata Database ────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - lakehouse-net
+
+  # ─── Spark Cluster ────────────────────────────────────────────────────────────
+
+  spark-master:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-master
+    hostname: spark-master
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    environment:
+      <<: *spark-common-env
+    volumes:
+      - ./dataset:/opt/spark/dataset:ro
+      - ./spark/jobs:/opt/spark/jobs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - lakehouse-net
+
+  spark-worker:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-worker
+    hostname: spark-worker
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --cores
+      - "2"
+      - --memory
+      - 3g
+      - spark://spark-master:7077
+    environment:
+      <<: *spark-common-env
+    volumes:
+      - ./dataset:/opt/spark/dataset:ro
+      - ./spark/jobs:/opt/spark/jobs:ro
+    depends_on:
+      - spark-master
+    networks:
+      - lakehouse-net
+
+  # ─── Airflow ──────────────────────────────────────────────────────────────────
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    command:
+      - bash
+      - -c
+      - >-
+        airflow db upgrade &&
+        airflow users create --username "${AIRFLOW_ADMIN_USERNAME}" --password "${AIRFLOW_ADMIN_PASSWORD}" --firstname Admin --lastname User --role Admin --email admin@airflow.com &&
+        (echo '{"spark_default":{"conn_type":"spark","host":"spark://spark-master:7077"}}' > /tmp/sc.json && airflow connections import /tmp/sc.json || true)
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    hostname: airflow-webserver
+    ports:
+      - "8082:8080"
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ─── Dremio (Data Warehouse) ──────────────────────────────────────────────────
+
+  dremio:
+    image: dremio/dremio-oss:24.3.0
+    container_name: dremio
+    ports:
+      - "9047:9047"   # REST API + UI
+      - "31010:31010" # JDBC/ODBC
+      - "45678:45678" # Arrow Flight
+    volumes:
+      - dremio-data:/opt/dremio/data
+    environment:
+      DREMIO_JAVA_SERVER_EXTRA_OPTS: >-
+        -Dpaths.dist=file:///opt/dremio/data/dist
+        -Xmx2g
+        -Xms512m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9047 || exit 1"]
+      interval: 30s
+      timeout: 20s
+      retries: 15
+      start_period: 60s
+    networks:
+      - lakehouse-net
+
+  dremio-setup:
+    image: python:3.11-slim
+    container_name: dremio-setup
+    depends_on:
+      dremio:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+    environment:
+      DREMIO_HOST: dremio
+      DREMIO_PORT: "9047"
+      DREMIO_USERNAME: ${DREMIO_USERNAME}
+      DREMIO_PASSWORD: ${DREMIO_PASSWORD}
+      NESSIE_URI: ${NESSIE_URI}
+      NESSIE_URI_V2: ${NESSIE_URI_V2}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: >
+      /bin/sh -c "pip install -q requests && python /scripts/setup_dremio.py"
+    restart: "no"
+    networks:
+      - lakehouse-net
+
+  # ─── Apache Superset (Dashboard) ─────────────────────────────────────────────
+
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    container_name: superset
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/superset
+      SUPERSET_ADMIN_USERNAME: ${SUPERSET_ADMIN_USERNAME}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+      SUPERSET_ADMIN_EMAIL: ${SUPERSET_ADMIN_EMAIL}
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 15
+      start_period: 60s
+    networks:
+      - lakehouse-net
+
+  superset-init:
+    image: python:3.11-slim
+    container_name: superset-init
+    depends_on:
+      superset:
+        condition: service_healthy
+      dremio:
+        condition: service_healthy
+    environment:
+      SUPERSET_HOST: superset
+      SUPERSET_PORT: "8088"
+      SUPERSET_ADMIN_USERNAME: ${SUPERSET_ADMIN_USERNAME}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+      DREMIO_HOST: dremio
+      DREMIO_PORT: "9047"
+      DREMIO_USERNAME: ${DREMIO_USERNAME}
+      DREMIO_PASSWORD: ${DREMIO_PASSWORD}
+    volumes:
+      - ./superset/init_dashboard.py:/init_dashboard.py:ro
+    entrypoint: >
+      /bin/sh -c "pip install -q requests && python /init_dashboard.py"
+    restart: "no"
+    networks:
+      - lakehouse-net
+
+volumes:
+  minio-data:
+  postgres-data:
+  dremio-data:
+  airflow-logs:
+
+networks:
+  lakehouse-net:
+    name: lakehouse-net
+    driver: bridge

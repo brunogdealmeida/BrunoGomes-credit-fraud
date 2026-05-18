@@ -1,0 +1,65 @@
+version: 2
+
+sources:
+  - name: silver_layer
+    description: "Validated transactions in the Silver Iceberg layer (wrapper view in home space)"
+    database: "@{{ env_var('DREMIO_USERNAME', 'admin') }}"
+    schema: silver
+    tables:
+      - name: tb_fraud_credit
+        description: "Cleaned and enriched fraud transaction records"
+        columns:
+          - name: timestamp
+            description: "Unix epoch transaction timestamp"
+            tests:
+              - not_null
+          - name: sending_address
+            description: "Sender wallet/account address"
+            tests:
+              - not_null
+          - name: receiving_address
+            description: "Receiver wallet/account address"
+            tests:
+              - not_null
+          - name: amount
+            description: "Transaction amount"
+            tests:
+              - not_null
+          - name: transaction_type
+            description: "Type of transaction"
+            tests:
+              - not_null
+              - accepted_values:
+                  values: ["purchase", "sale", "transfer", "phishing", "scam"]
+          - name: location_region
+            description: "Geographic region of the transaction"
+            tests:
+              - not_null
+              - accepted_values:
+                  values: ["Africa", "Asia", "Europe", "North America", "South America"]
+          - name: anomaly
+            description: "Risk classification label"
+            tests:
+              - not_null
+              - accepted_values:
+                  values: ["low_risk", "moderate_risk", "high_risk"]
+          - name: risk_score
+            description: "Numeric risk score (0–100)"
+            tests:
+              - not_null
+
+  - name: gold_layer
+    description: "Gold aggregation tables created by Spark"
+    database: nessie_lakehouse
+    schema: gold
+    tables:
+      - name: fraud_by_region
+        description: "Fraud transaction counts and amounts by region and anomaly type"
+      - name: fraud_by_type
+        description: "Fraud stats grouped by transaction type, anomaly, and purchase pattern"
+      - name: daily_fraud_metrics
+        description: "Daily transaction counts and risk metrics by date and region"
+      - name: high_risk_transactions
+        description: "All transactions with anomaly=high_risk or risk_score >= 75"
+      - name: risk_profile
+        description: "Risk score distribution by user segment (age_group × purchase_pattern)"

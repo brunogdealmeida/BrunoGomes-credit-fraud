@@ -1,0 +1,7 @@
+spark:
+  nessie_uri: "http://nessie:19120/api/v1"         # overridden by $NESSIE_URI
+  minio_endpoint: "http://minio:9000"               # overridden by $MINIO_ENDPOINT
+  minio_access_key: ""                              # set via $MINIO_ROOT_USER
+  minio_secret_key: ""                              # set via $MINIO_ROOT_PASSWORD
+  warehouse: "s3a://lakehouse/"
+  dataset_dir: "/opt/spark/dataset"                 # overridden by $DATASET_DIR

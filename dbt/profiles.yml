@@ -1,0 +1,12 @@
+datalakehouse:
+  target: dev
+  outputs:
+    dev:
+      type: dremio
+      software_host: "{{ env_var('DREMIO_HOST', 'dremio') }}"
+      port: 9047
+      user: "{{ env_var('DREMIO_USERNAME', 'admin') }}"
+      password: "{{ env_var('DREMIO_PASSWORD') }}"
+      database: "@{{ env_var('DREMIO_USERNAME', 'admin') }}"
+      schema: dbt_quality
+      use_ssl: false
