@@ -22,14 +22,12 @@ MINIO_ACCESS_KEY = os.environ["MINIO_ROOT_USER"]
 MINIO_SECRET_KEY = os.environ["MINIO_ROOT_PASSWORD"]
 
 
-def wait_for_dremio(retries: int = 30, delay: int = 10) -> None:
+def wait_for_dremio(retries: int = 40, delay: int = 10) -> None:
     for i in range(retries):
         try:
             r = requests.get(BASE_URL, timeout=5)
             if r.status_code < 500:
                 print("[dremio-setup] Dremio HTTP endpoint is responding")
-                # Extra stabilisation wait — the API may still be initialising
-                time.sleep(30)
                 return
         except Exception:
             pass
@@ -41,6 +39,8 @@ def wait_for_dremio(retries: int = 30, delay: int = 10) -> None:
 def bootstrap_first_user() -> bool:
     """
     Attempt to set up the initial admin account.
+    Retries up to ~3 minutes because Dremio's REST API initialises
+    after the HTTP server starts, making early calls return 404.
     Returns True if a new account was created, False if already exists.
     """
     payload = {
@@ -50,33 +50,43 @@ def bootstrap_first_user() -> bool:
         "email": "admin@lakehouse.local",
         "password": PASSWORD,
     }
-    r = requests.put(f"{BASE_URL}/apiv2/bootstrap/firstlogin", json=payload, timeout=15)
-    if r.status_code == 200:
-        print("[dremio-setup] Admin user created via bootstrap")
-        return True
-    elif r.status_code == 404:
-        print("[dremio-setup] Bootstrap endpoint not found — Dremio may already be initialised")
-        return False
-    elif r.status_code in (400, 409):
-        print(f"[dremio-setup] Bootstrap skipped ({r.status_code}) — likely already done")
-        return False
-    else:
-        print(f"[dremio-setup] Bootstrap returned {r.status_code}: {r.text[:200]}")
-        return False
+    for attempt in range(1, 19):  # 18 × 10 s ≈ 3 min
+        r = requests.put(f"{BASE_URL}/apiv2/bootstrap/firstlogin", json=payload, timeout=15)
+        if r.status_code == 200:
+            print("[dremio-setup] Admin user created via bootstrap")
+            time.sleep(5)  # let Dremio persist the new user before login
+            return True
+        if r.status_code in (400, 409):
+            print(f"[dremio-setup] Bootstrap skipped ({r.status_code}) — user already exists")
+            return False
+        # 404 means API not ready yet; any other code also warrants a retry
+        print(
+            f"[dremio-setup] Bootstrap attempt {attempt}/18 → {r.status_code}"
+            f" (API may still be initialising) — retrying in 10 s…"
+        )
+        time.sleep(10)
+    print("[dremio-setup] Bootstrap did not succeed — will attempt login anyway")
+    return False
 
 
-def get_token() -> str | None:
+def get_token(retries: int = 6, delay: int = 10) -> str | None:
     """Authenticate and return a Dremio API token, or None on failure."""
-    r = requests.post(
-        f"{BASE_URL}/apiv2/login",
-        json={"userName": USERNAME, "password": PASSWORD},
-        timeout=15,
-    )
-    if r.ok:
-        token = r.json().get("token", "")
-        print(f"[dremio-setup] Authenticated as '{USERNAME}'")
-        return token
-    print(f"[dremio-setup] Login failed ({r.status_code}): {r.text[:200]}")
+    for attempt in range(1, retries + 1):
+        r = requests.post(
+            f"{BASE_URL}/apiv2/login",
+            json={"userName": USERNAME, "password": PASSWORD},
+            timeout=15,
+        )
+        if r.ok:
+            token = r.json().get("token", "")
+            print(f"[dremio-setup] Authenticated as '{USERNAME}'")
+            return token
+        print(
+            f"[dremio-setup] Login attempt {attempt}/{retries} failed"
+            f" ({r.status_code}): {r.text[:200]}"
+        )
+        if attempt < retries:
+            time.sleep(delay)
     return None
 
 

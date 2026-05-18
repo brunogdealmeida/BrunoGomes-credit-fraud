@@ -199,7 +199,12 @@ jobs:
 
       # ── Register Nessie source in Dremio ──────────────────────────────────
       - name: Dremio setup (register Nessie + MinIO source)
-        run: docker compose run --rm dremio-setup
+        run: |
+          for attempt in 1 2 3; do
+            docker compose run --rm dremio-setup && break
+            echo "dremio-setup attempt $attempt failed — retrying in 30 s…"
+            sleep 30
+          done
 
       # ── Integration tests ─────────────────────────────────────────────────
       # Tests run on the host and connect to services via exposed localhost ports.
