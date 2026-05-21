@@ -182,8 +182,8 @@ docker compose ps                      # Verifica status de todos os containers
 | Serviço          | URL                          | Usuário / Senha                    |
 |------------------|------------------------------|------------------------------------|
 | Airflow UI       | http://localhost:8082        | admin / admin123                   |
-| Dremio UI        | http://localhost:9047        | ver `.env` (DREMIO_USERNAME/PASSWORD) |
-| MinIO Console    | http://localhost:9001        | ver `.env` (MINIO_ROOT_USER/PASSWORD) |
+| Dremio UI        | http://localhost:9047        | admin / admin123                   |
+| MinIO Console    | http://localhost:9001        | admin / password123                |
 | Superset         | http://localhost:8088        | admin / admin123                   |
 | OpenMetadata     | http://localhost:8585        | admin@openmetadata.org / admin     |
 | Grafana          | http://localhost:3001        | admin / admin                      |
