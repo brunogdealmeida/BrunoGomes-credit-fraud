@@ -115,42 +115,10 @@ with DAG(
         task_id="dbt_quality_tests",
         bash_command="""
             set -e
-
-            # Ensure the silver wrapper view exists in Dremio home space
-            python3 - <<'PYEOF'
-import os, sys, requests, json
-
-host = os.environ["DREMIO_HOST"]
-user = os.environ["DREMIO_USERNAME"]
-password = os.environ["DREMIO_PASSWORD"]
-base = f"http://{host}:9047"
-
-r = requests.post(f"{base}/apiv2/login", json={"userName": user, "password": password}, timeout=30)
-r.raise_for_status()
-token = r.json()["token"]
-h = {"Authorization": f"_dremio{token}", "Content-Type": "application/json"}
-
-requests.post(f"{base}/api/v3/catalog", headers=h, json={"entityType": "folder", "path": [f"@{user}", "silver"]})
-
-chk = requests.get(f"{base}/api/v3/catalog/by-path/@{user}/silver/tb_fraud_credit", headers=h)
-if chk.status_code == 404:
-    r2 = requests.post(f"{base}/api/v3/catalog", headers=h, json={
-        "entityType": "dataset",
-        "path": [f"@{user}", "silver", "tb_fraud_credit"],
-        "type": "VIRTUAL_DATASET",
-        "sql": "SELECT * FROM nessie_lakehouse.silver.tb_fraud_credit AT BRANCH main",
-        "sqlContext": [f"@{user}"],
-    })
-    r2.raise_for_status()
-    print(f"[dremio-setup] Created @{user}.silver.tb_fraud_credit wrapper view")
-else:
-    print(f"[dremio-setup] Wrapper view @{user}.silver.tb_fraud_credit already exists")
-PYEOF
-
             cd /opt/dbt
             dbt deps --profiles-dir /opt/dbt
-            dbt run --profiles-dir /opt/dbt --target dev
             dbt test --profiles-dir /opt/dbt --target dev
+            dbt docs generate --profiles-dir /opt/dbt --target dev
         """,
         env={
             "DREMIO_HOST": "dremio",

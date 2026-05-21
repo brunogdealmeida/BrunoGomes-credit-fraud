@@ -21,7 +21,7 @@ CSV (~1M linhas)
       │
       ▼
  [Silver Layer]          Validação + enriquecimento
- fraud_transactions       ~1.031.544 linhas válidas
+ tb_fraud_credit          ~1.031.544 linhas válidas
  + [Quarantine]           linhas rejeitadas separadas
       │
       ▼
@@ -33,11 +33,20 @@ CSV (~1M linhas)
  risk_profile
       │
       ▼
- [dbt Quality]           4 modelos view + 21 testes
- Dremio OSS 24.3.0        dbt-dremio 1.7.0
+ [dbt Quality]           53 testes (porta de qualidade pura)
+ Dremio OSS 24.3.0        Testa tabelas Spark diretamente via Dremio
+ dbt-dremio 1.7.0         Não materializa nenhum modelo
       │
       ▼
  [Dashboard]             Apache Superset 3.1.3
+      │
+      ▼
+ [Data Catalog]          OpenMetadata 1.5.0
+ Lineage Airflow          Metadados MinIO + pipelines
+      │
+      ▼
+ [Monitoring]            Prometheus + Grafana
+ cAdvisor                 Métricas de containers e PostgreSQL
 ```
 
 ### Stack completa
@@ -52,6 +61,8 @@ CSV (~1M linhas)
 | Query Engine      | Dremio OSS                        | 24.3.0     |
 | Data Quality      | dbt + dbt-dremio                  | 1.7.9      |
 | Dashboard         | Apache Superset                   | 3.1.3      |
+| Data Catalog      | OpenMetadata                      | 1.5.0      |
+| Monitoring        | Prometheus + Grafana              | v2.51 / 10.x |
 | Metadata DB       | PostgreSQL                        | 15         |
 
 ---
@@ -85,16 +96,19 @@ datalakehouse-project/
 │       └── gold_aggregation.py
 ├── dbt/
 │   ├── profiles.yml              # Conexão dbt → Dremio
-│   ├── dbt_project.yml
+│   ├── dbt_project.yml           # models: {} — dbt não materializa nada
 │   ├── packages.yml
 │   ├── macros/
-│   │   └── test_not_null.sql     # Override crítico para coluna "timestamp"
+│   │   └── test_not_null.sql     # Override para aspas em nomes de colunas
 │   └── models/
-│       ├── sources.yml           # Silver aponta para wrapper view no Dremio
-│       ├── silver/
-│       └── gold/
+│       └── sources.yml           # 6 fontes + 53 testes (Silver + 5 Gold)
+├── openmetadata/
+│   └── ingestion/
+│       ├── airflow.yaml          # Config ingestion Airflow → OpenMetadata
+│       └── minio.yaml            # Config ingestion MinIO → OpenMetadata
 └── scripts/
-    └── setup_dremio.py           # Configura fonte Nessie no Dremio automaticamente
+    ├── setup_dremio.py           # Configura fonte Nessie no Dremio automaticamente
+    └── setup_openmetadata.py     # Bootstrap OpenMetadata (login + ingestion)
 ```
 
 ---
@@ -165,14 +179,17 @@ docker compose ps                      # Verifica status de todos os containers
 
 ### 3. Verificar serviços disponíveis
 
-| Serviço          | URL                          | Usuário / Senha           |
-|------------------|------------------------------|---------------------------|
-| Airflow UI       | http://localhost:8082        | admin / admin123          |
-| Dremio UI        | http://localhost:9047        | adm-datalab / DataEnv2025-|
-| MinIO Console    | http://localhost:9001        | admin / password123       |
-| Nessie API       | http://localhost:19120       | —                         |
-| Spark Master UI  | http://localhost:8080        | —                         |
-| Superset         | http://localhost:8088        | admin / admin123          |
+| Serviço          | URL                          | Usuário / Senha                    |
+|------------------|------------------------------|------------------------------------|
+| Airflow UI       | http://localhost:8082        | admin / admin123                   |
+| Dremio UI        | http://localhost:9047        | ver `.env` (DREMIO_USERNAME/PASSWORD) |
+| MinIO Console    | http://localhost:9001        | ver `.env` (MINIO_ROOT_USER/PASSWORD) |
+| Superset         | http://localhost:8088        | admin / admin123                   |
+| OpenMetadata     | http://localhost:8585        | admin@openmetadata.org / admin     |
+| Grafana          | http://localhost:3001        | admin / admin                      |
+| Prometheus       | http://localhost:9090        | —                                  |
+| Nessie API       | http://localhost:19120       | —                                  |
+| Spark Master UI  | http://localhost:8080        | —                                  |
 
 ### 4. Disparar o pipeline no Airflow
 
@@ -233,68 +250,39 @@ payload = {
 
 ---
 
-### C2. Dremio exige `AT BRANCH main` para tabelas Nessie
+### C2. dbt aponta diretamente para o catálogo Nessie (sem wrapper views)
 
 **Arquivos afetados**: `dbt/models/sources.yml`, `airflow/dags/fraud_lakehouse_pipeline.py`
 
-**Problema**: O Dremio 24.x requer contexto explícito de versão para todas as referências a tabelas no catálogo Nessie. Qualquer SQL sem `AT BRANCH main` falha com:
+**Contexto**: O Dremio 24.x historicamente exigia `AT BRANCH main` em queries Nessie. A solução anterior criava wrapper views no home space do usuário antes de cada execução do dbt. Essa abordagem foi removida.
 
-```
-Validation of view sql failed. Version context for table
-nessie_lakehouse.silver.fraud_transactions must be specified using AT SQL syntax
-```
-
-Não é possível definir um branch padrão permanente via `ALTER SOURCE` (o Dremio não suporta essa sintaxe para fontes Nessie).
-
-**Solução**: Criar uma **wrapper view** no home space do usuário no Dremio que encapsula a cláusula `AT BRANCH main`:
-
-```sql
--- View criada em: @adm-datalab.silver.fraud_transactions
-SELECT * FROM nessie_lakehouse.silver.fraud_transactions AT BRANCH main
-```
-
-Esta view é criada automaticamente pelo BashOperator antes de cada execução do dbt. Código inline Python no DAG:
-
-```python
-# Cria a pasta silver se não existir
-requests.post(f"{base}/api/v3/catalog", headers=h, json={
-    "entityType": "folder",
-    "path": [f"@{user}", "silver"]
-})
-
-# Verifica se a view já existe
-chk = requests.get(
-    f"{base}/api/v3/catalog/by-path/@{user}/silver/fraud_transactions",
-    headers=h
-)
-if chk.status_code == 404:
-    requests.post(f"{base}/api/v3/catalog", headers=h, json={
-        "entityType": "dataset",
-        "path": [f"@{user}", "silver", "fraud_transactions"],
-        "type": "VIRTUAL_DATASET",
-        "sql": "SELECT * FROM nessie_lakehouse.silver.fraud_transactions AT BRANCH main",
-        "sqlContext": [f"@{user}"],
-    })
-```
-
-No `dbt/models/sources.yml`, o silver layer aponta para esta wrapper view (não direto para o Nessie):
+**Solução atual**: As sources do dbt apontam diretamente para `nessie_lakehouse.*`. O Dremio resolve o branch via a fonte Nessie registrada, sem necessidade de wrapper views ou `AT BRANCH` explícito nas queries geradas pelo dbt.
 
 ```yaml
+# dbt/models/sources.yml
 sources:
-  - name: silver_layer
-    database: "@{{ env_var('DREMIO_USERNAME', 'admin') }}"  # home space do usuário
+  - name: silver
+    database: nessie_lakehouse   # catálogo Nessie registrado no Dremio
     schema: silver
     tables:
-      - name: fraud_transactions
-```
+      - name: tb_fraud_credit
 
-O gold layer aponta direto para `nessie_lakehouse` pois não há testes de coluna que gerariam SQL sem `AT BRANCH`:
-
-```yaml
-  - name: gold_layer
+  - name: gold
     database: nessie_lakehouse
     schema: gold
+    tables:
+      - name: fraud_by_region
+      # ... mais 4 tabelas gold
 ```
+
+A task `dbt_quality_tests` no DAG executa apenas:
+
+```bash
+dbt deps --profiles-dir /opt/dbt
+dbt test --profiles-dir /opt/dbt --target dev
+```
+
+**Sem** criação de views, **sem** `dbt run`. O dbt é uma porta de qualidade pura (53 testes, 0 modelos).
 
 ---
 
@@ -394,26 +382,50 @@ NESSIE_URI_V2=http://nessie:19120/api/v2   # usado pelo setup_dremio.py
 
 **Por quê**: O cliente S3 nativo do Dremio adiciona o protocolo automaticamente baseado no parâmetro `secure`. Com `http://` no endpoint, ele constrói URLs inválidas (virtual-hosted), causando timeout de 165 segundos.
 
+### `scripts/setup_openmetadata.py` — CRIADO (novo arquivo)
+
+Script de bootstrap do OpenMetadata: obtém token JWT via login, renderiza configs de ingestion com variáveis de ambiente, e executa `metadata ingest` para MinIO e Airflow.
+
+**Detalhes não-óbvios**:
+- A senha deve ser enviada em **Base64** para a API de login
+- O endpoint de health check retorna **HTTP 401** quando o servidor está saudável mas requer autenticação — tratar 401 como "saudável"
+- O conector Dremio **não existe** no OpenMetadata 1.5.0 — ignorar
+- Email padrão do admin: `admin@openmetadata.org` (sem hífen)
+
+### `openmetadata/ingestion/airflow.yaml` — CRIADO (novo arquivo)
+
+Config de ingestion do Airflow para o OpenMetadata. Usa conexão **Postgres** (banco de metadados do Airflow) em vez de conexão HTTP:
+
+```yaml
+connection:
+  type: Postgres
+  username: "${POSTGRES_USER}"
+  authType:
+    password: "${POSTGRES_PASSWORD}"
+  hostPort: "postgres:5432"
+  database: "${POSTGRES_DB}"
+```
+
 ### `airflow/dags/fraud_lakehouse_pipeline.py` — Modificado
 
 **O que mudou**:
 1. Adicionado `spark.driver.host=airflow-scheduler` e `spark.driver.bindAddress=0.0.0.0` ao `SPARK_CONF`
-2. Task `dbt_quality_tests` modificada de chamada simples de dbt para `BashOperator` com:
-   - Script Python inline que cria/verifica a wrapper view no Dremio antes do dbt
-   - `dbt deps`, `dbt run`, `dbt test` em sequência com `set -e`
-   - `append_env=True` para preservar `PATH` do container (necessário para encontrar `dbt` e `python3`)
+2. Task `dbt_quality_tests` simplificada — removidos criação de wrapper views e `dbt run`:
+   ```bash
+   dbt deps --profiles-dir /opt/dbt
+   dbt test --profiles-dir /opt/dbt --target dev
+   ```
 
-### `dbt/models/sources.yml` — Modificado
+### `dbt/dbt_project.yml` — Modificado
 
-**O que mudou**: A source `silver_layer` foi atualizada:
-- `database`: alterado de `nessie_lakehouse` para `"@{{ env_var('DREMIO_USERNAME', 'admin') }}"` (aponta para o home space do usuário no Dremio)
-- `schema`: permanece `silver`
+`models: {}` — dbt não materializa nenhum modelo. É exclusivamente uma porta de qualidade.
 
-**Por quê**: O Dremio requer `AT BRANCH main` nas queries Nessie. A wrapper view no home space encapsula isso transparentemente para o dbt.
+### `dbt/models/sources.yml` — Modificado (reescrito)
 
-### `dbt/macros/test_not_null.sql` — CRIADO (novo arquivo)
+Aponta Silver e Gold diretamente para `nessie_lakehouse.*`. Contém 53 testes distribuídos em 6 fontes (1 Silver + 5 Gold). Removidos modelos SQL do Gold (duplicavam o trabalho do Spark).
 
-**Conteúdo**:
+### `dbt/macros/test_not_null.sql` — Mantido (arquivo existente)
+
 ```sql
 {% test not_null(model, column_name) %}
   select "{{ column_name }}"
@@ -422,19 +434,57 @@ NESSIE_URI_V2=http://nessie:19120/api/v2   # usado pelo setup_dremio.py
 {% endtest %}
 ```
 
-**Por quê**: Override necessário para que nomes de colunas sejam sempre escapados com aspas duplas no SQL gerado, resolvendo o conflito da coluna `timestamp` com a palavra reservada de mesmo nome no Dremio.
+Override necessário para escapar nomes de colunas com aspas duplas, resolvendo o conflito da coluna `timestamp` com palavra reservada SQL no Dremio.
 
 ---
 
 ## Notas Operacionais
 
+### Acúmulo de disco no diretório de trabalho do Spark
+
+O Spark grava artefatos de job em `/opt/spark/work` dentro do container `spark-worker`. Cada execução do pipeline acumula ~400 MB. Após ~60 execuções isso pode consumir 25+ GB e causar erros "No space left on device" no Spark.
+
+Limpeza manual quando necessário:
+
+```bash
+docker exec spark-worker sh -c "cd /opt/spark/work && for d in app-2*; do rm -rf \"\$d\"; done"
+```
+
+### Dremio OOMKill sob pressão de memória
+
+O Dremio está configurado com `-Xmx1500m`. Durante execuções de jobs Spark, a VM Docker pode ficar sem memória e matar o Dremio (exit code 137).
+
+O design do pipeline mitiga isso: as tasks Spark completam primeiro e o Dremio só é necessário para o `dbt_quality_tests` ao final.
+
+Se o Dremio for morto: `docker compose up -d dremio`
+
+**Requisito de RAM**: O Docker Desktop deve ter **mínimo 12 GB** alocados (Settings → Resources → Memory). Com menos, o Dremio compete com Spark e é OOMKilled.
+
+### Catálogo Nessie desatualizado após deleção direta no MinIO
+
+Deletar arquivos diretamente no MinIO (sem passar pelo Spark/Iceberg) deixa ponteiros de metadados órfãos no Nessie, causando `NotFoundException` na próxima execução do pipeline.
+
+**Diagnóstico**: `org.apache.iceberg.exceptions.NotFoundException: Failed to open input stream for file: s3a://lakehouse/bronze/...`
+
+**Solução**: Use a API REST do Nessie v2 para commitar operações DELETE nas entradas de tabela afetadas:
+
+```bash
+# Verificar estado atual do branch main
+curl http://localhost:19120/api/v2/trees/main
+
+# Deletar entrada de tabela órfã via commit Nessie
+curl -X POST "http://localhost:19120/api/v2/trees/main/history/commit" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "remove stale bronze entry", "operations": [{"type": "DELETE", "key": {"elements": ["bronze", "tb_fraud_credit"]}}]}'
+```
+
 ### Reiniciar o Dremio corretamente
 
-**SEMPRE use `docker-compose restart`, NUNCA `docker restart`**:
+**SEMPRE use `docker compose restart`, NUNCA `docker restart`**:
 
 ```bash
 # CORRETO
-docker-compose restart dremio
+docker compose restart dremio
 
 # ERRADO — pode corromper o índice Lucene e desconectar da rede lakehouse-net
 docker restart dremio
@@ -447,7 +497,7 @@ docker restart dremio
 Se todas as queries no Dremio retornarem erro 400 com mensagem `Unexpected error occurred` nos logs:
 
 ```bash
-docker-compose logs dremio | grep AlreadyClosedException
+docker compose logs dremio | grep AlreadyClosedException
 # org.apache.lucene.store.AlreadyClosedException: this IndexWriter is closed
 ```
 
@@ -458,16 +508,14 @@ docker-compose logs dremio | grep AlreadyClosedException
 # Verificar espaço em disco
 df -h /var/lib/docker
 
-# Liberar cache de builds Docker (pode liberar 20+ GB)
-docker builder prune -f
+# Limpar diretório de trabalho do Spark
+docker exec spark-worker sh -c "cd /opt/spark/work && for d in app-2*; do rm -rf \"\$d\"; done"
 
 # Reiniciar Dremio graciosamente
-docker-compose restart dremio
+docker compose restart dremio
 ```
 
 ### Monitorar espaço em disco
-
-Docker accumula cache de builds que pode consumir dezenas de GB:
 
 ```bash
 docker system df           # mostra uso total
@@ -475,13 +523,13 @@ docker builder prune -f    # remove cache de builds (seguro)
 docker image prune -f      # remove imagens não utilizadas
 ```
 
-### A pasta `dbt_quality` no Dremio
+### OpenMetadata — lockout por tentativas de login
 
-O dbt-dremio cria modelos no schema `dbt_quality` dentro do home space do usuário. Esta pasta é criada automaticamente na primeira execução do `dbt run`. Se precisar recriar manualmente:
+O OpenMetadata bloqueia o admin após múltiplas tentativas de senha incorretas. O estado de bloqueio é em memória:
 
-1. Acesse o Dremio UI em http://localhost:9047
-2. Vá para **Datasets** → **Home** → `@adm-datalab`
-3. Crie uma nova pasta chamada `dbt_quality`
+```bash
+docker restart openmetadata-server   # limpa o contador de tentativas
+```
 
 ---
 
@@ -525,10 +573,13 @@ docker exec -it spark-master /opt/spark/bin/spark-sql \
 
 ### dbt (resultado esperado)
 ```
-dbt run:  Completed successfully
-          Found 4 models: silver__fraud_validation, gold__fraud_by_region,
-                          gold__fraud_summary, gold__high_risk_analysis
-dbt test: Completed with 21 passed
+dbt deps: Installing dbt-labs/dbt_utils (1.3.0)
+
+dbt test: Found 53 tests, 6 sources, 0 models
+          Concurrency: 1 threads (target='dev')
+          Finished running 53 tests
+          Completed successfully
+          PASS=53 WARN=0 ERROR=0 SKIP=0 TOTAL=53
 ```
 
 ---
@@ -576,7 +627,7 @@ CSV (~1M rows)
       │
       ▼
  [Silver Layer]          Validation + enrichment
- fraud_transactions       ~1,031,544 valid rows
+ tb_fraud_credit          ~1,031,544 valid rows
  + [Quarantine]           rejected records isolated
       │
       ▼
@@ -588,11 +639,20 @@ CSV (~1M rows)
  risk_profile
       │
       ▼
- [dbt Quality]           4 view models + 21 tests
- Dremio OSS 24.3.0        dbt-dremio 1.7.0
+ [dbt Quality]           53 tests (pure quality gate)
+ Dremio OSS 24.3.0        Tests Spark tables directly via Dremio
+ dbt-dremio 1.7.0         Materializes no models
       │
       ▼
  [Dashboard]             Apache Superset 3.1.3
+      │
+      ▼
+ [Data Catalog]          OpenMetadata 1.5.0
+ Airflow lineage          MinIO + pipeline metadata
+      │
+      ▼
+ [Monitoring]            Prometheus + Grafana
+ cAdvisor                 Container and PostgreSQL metrics
 ```
 
 ### Full Stack
@@ -607,6 +667,8 @@ CSV (~1M rows)
 | Query Engine      | Dremio OSS                        | 24.3.0     |
 | Data Quality      | dbt + dbt-dremio                  | 1.7.9      |
 | Dashboard         | Apache Superset                   | 3.1.3      |
+| Data Catalog      | OpenMetadata                      | 1.5.0      |
+| Monitoring        | Prometheus + Grafana              | v2.51 / 10.x |
 | Metadata DB       | PostgreSQL                        | 15         |
 
 ---
@@ -720,14 +782,17 @@ docker compose ps                      # Check status of all containers
 
 ### 3. Verify available services
 
-| Service          | URL                          | Username / Password        |
-|------------------|------------------------------|----------------------------|
-| Airflow UI       | http://localhost:8082        | admin / admin123           |
-| Dremio UI        | http://localhost:9047        | adm-datalab / DataEnv2025- |
-| MinIO Console    | http://localhost:9001        | admin / password123        |
-| Nessie API       | http://localhost:19120       | —                          |
-| Spark Master UI  | http://localhost:8080        | —                          |
-| Superset         | http://localhost:8088        | admin / admin123           |
+| Service          | URL                          | Username / Password                  |
+|------------------|------------------------------|--------------------------------------|
+| Airflow UI       | http://localhost:8082        | admin / admin123                     |
+| Dremio UI        | http://localhost:9047        | see `.env` (DREMIO_USERNAME/PASSWORD) |
+| MinIO Console    | http://localhost:9001        | see `.env` (MINIO_ROOT_USER/PASSWORD) |
+| Superset         | http://localhost:8088        | admin / admin123                     |
+| OpenMetadata     | http://localhost:8585        | admin@openmetadata.org / admin       |
+| Grafana          | http://localhost:3001        | admin / admin                        |
+| Prometheus       | http://localhost:9090        | —                                    |
+| Nessie API       | http://localhost:19120       | —                                    |
+| Spark Master UI  | http://localhost:8080        | —                                    |
 
 ### 4. Trigger the pipeline in Airflow
 
@@ -788,68 +853,39 @@ payload = {
 
 ---
 
-### C2. Dremio requires `AT BRANCH main` for Nessie tables
+### C2. dbt points directly to the Nessie catalog (no wrapper views)
 
 **Affected files**: `dbt/models/sources.yml`, `airflow/dags/fraud_lakehouse_pipeline.py`
 
-**Problem**: Dremio 24.x requires explicit version context for all references to tables in the Nessie catalog. Any SQL without `AT BRANCH main` fails with:
+**Context**: Dremio 24.x historically required `AT BRANCH main` in Nessie queries. The previous approach created wrapper views in the user's home space before each dbt run. This approach has been removed.
 
-```
-Validation of view sql failed. Version context for table
-nessie_lakehouse.silver.fraud_transactions must be specified using AT SQL syntax
-```
-
-It is not possible to set a permanent default branch via `ALTER SOURCE` (Dremio does not support that syntax for Nessie sources).
-
-**Solution**: Create a **wrapper view** in the Dremio user's home space that encapsulates the `AT BRANCH main` clause:
-
-```sql
--- View created at: @adm-datalab.silver.fraud_transactions
-SELECT * FROM nessie_lakehouse.silver.fraud_transactions AT BRANCH main
-```
-
-This view is created automatically by the BashOperator before each dbt run. Inline Python in the DAG:
-
-```python
-# Create silver folder if it doesn't exist
-requests.post(f"{base}/api/v3/catalog", headers=h, json={
-    "entityType": "folder",
-    "path": [f"@{user}", "silver"]
-})
-
-# Check if view already exists
-chk = requests.get(
-    f"{base}/api/v3/catalog/by-path/@{user}/silver/fraud_transactions",
-    headers=h
-)
-if chk.status_code == 404:
-    requests.post(f"{base}/api/v3/catalog", headers=h, json={
-        "entityType": "dataset",
-        "path": [f"@{user}", "silver", "fraud_transactions"],
-        "type": "VIRTUAL_DATASET",
-        "sql": "SELECT * FROM nessie_lakehouse.silver.fraud_transactions AT BRANCH main",
-        "sqlContext": [f"@{user}"],
-    })
-```
-
-In `dbt/models/sources.yml`, the silver layer points to this wrapper view (not directly to Nessie):
+**Current solution**: dbt sources point directly to `nessie_lakehouse.*`. Dremio resolves the branch through the registered Nessie source, with no wrapper views or explicit `AT BRANCH` required in dbt-generated queries.
 
 ```yaml
+# dbt/models/sources.yml
 sources:
-  - name: silver_layer
-    database: "@{{ env_var('DREMIO_USERNAME', 'admin') }}"  # user's home space
+  - name: silver
+    database: nessie_lakehouse   # registered Nessie catalog in Dremio
     schema: silver
     tables:
-      - name: fraud_transactions
-```
+      - name: tb_fraud_credit
 
-The gold layer points directly to `nessie_lakehouse` because it has no column-level tests that would generate SQL without `AT BRANCH`:
-
-```yaml
-  - name: gold_layer
+  - name: gold
     database: nessie_lakehouse
     schema: gold
+    tables:
+      - name: fraud_by_region
+      # ... 4 more gold tables
 ```
+
+The `dbt_quality_tests` DAG task runs only:
+
+```bash
+dbt deps --profiles-dir /opt/dbt
+dbt test --profiles-dir /opt/dbt --target dev
+```
+
+**No** view creation, **no** `dbt run`. dbt is a pure quality gate (53 tests, 0 models).
 
 ---
 
@@ -983,13 +1019,47 @@ NESSIE_URI_V2=http://nessie:19120/api/v2   # used by setup_dremio.py
 
 ## Operational Notes
 
+### Spark work directory disk accumulation
+
+Spark writes job artifacts to `/opt/spark/work` inside the `spark-worker` container. Each pipeline run accumulates ~400 MB. After ~60 runs this can consume 25+ GB and cause "No space left on device" errors in Spark.
+
+Manual cleanup when needed:
+
+```bash
+docker exec spark-worker sh -c "cd /opt/spark/work && for d in app-2*; do rm -rf \"\$d\"; done"
+```
+
+### Dremio OOMKill under memory pressure
+
+Dremio is configured with `-Xmx1500m`. During Spark job execution the Docker VM may run out of memory and OOMKill Dremio (exit code 137).
+
+The pipeline design mitigates this: Spark tasks complete first and Dremio is only needed for `dbt_quality_tests` at the end.
+
+If Dremio is killed: `docker compose up -d dremio`
+
+**RAM requirement**: Docker Desktop must have **at least 12 GB** allocated (Settings → Resources → Memory). With less, Dremio competes with Spark and gets OOMKilled.
+
+### Stale Nessie catalog after direct MinIO deletion
+
+Deleting files directly from MinIO (bypassing Spark/Iceberg) leaves orphaned metadata pointers in Nessie, causing `NotFoundException` on the next pipeline run.
+
+**Diagnosis**: `org.apache.iceberg.exceptions.NotFoundException: Failed to open input stream for file: s3a://lakehouse/bronze/...`
+
+**Fix**: Use the Nessie v2 REST API to commit DELETE operations on the affected table entries:
+
+```bash
+curl -X POST "http://localhost:19120/api/v2/trees/main/history/commit" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "remove stale bronze entry", "operations": [{"type": "DELETE", "key": {"elements": ["bronze", "tb_fraud_credit"]}}]}'
+```
+
 ### Restarting Dremio correctly
 
-**ALWAYS use `docker-compose restart`, NEVER `docker restart`**:
+**ALWAYS use `docker compose restart`, NEVER `docker restart`**:
 
 ```bash
 # CORRECT
-docker-compose restart dremio
+docker compose restart dremio
 
 # WRONG — may corrupt the Lucene index and disconnect from lakehouse-net
 docker restart dremio
@@ -1002,7 +1072,7 @@ docker restart dremio
 If all queries in Dremio return error 400 with `Unexpected error occurred` in the logs:
 
 ```bash
-docker-compose logs dremio | grep AlreadyClosedException
+docker compose logs dremio | grep AlreadyClosedException
 # org.apache.lucene.store.AlreadyClosedException: this IndexWriter is closed
 ```
 
@@ -1013,16 +1083,14 @@ docker-compose logs dremio | grep AlreadyClosedException
 # Check disk space
 df -h /var/lib/docker
 
-# Free Docker build cache (can free 20+ GB)
-docker builder prune -f
+# Clean Spark work directory
+docker exec spark-worker sh -c "cd /opt/spark/work && for d in app-2*; do rm -rf \"\$d\"; done"
 
 # Gracefully restart Dremio
-docker-compose restart dremio
+docker compose restart dremio
 ```
 
 ### Monitor disk space
-
-Docker accumulates build cache that can consume tens of GB:
 
 ```bash
 docker system df           # show total usage
@@ -1030,13 +1098,13 @@ docker builder prune -f    # remove build cache (safe)
 docker image prune -f      # remove unused images
 ```
 
-### The `dbt_quality` folder in Dremio
+### OpenMetadata — login lockout
 
-dbt-dremio creates models in the `dbt_quality` schema inside the user's home space. This folder is created automatically on the first `dbt run`. If you need to create it manually:
+OpenMetadata locks out the admin after multiple failed login attempts. The lockout state is in-memory:
 
-1. Open the Dremio UI at http://localhost:9047
-2. Go to **Datasets** → **Home** → `@adm-datalab`
-3. Create a new folder called `dbt_quality`
+```bash
+docker restart openmetadata-server   # clears the attempt counter
+```
 
 ---
 
@@ -1080,10 +1148,13 @@ docker exec -it spark-master /opt/spark/bin/spark-sql \
 
 ### dbt (expected result)
 ```
-dbt run:  Completed successfully
-          Found 4 models: silver__fraud_validation, gold__fraud_by_region,
-                          gold__fraud_summary, gold__high_risk_analysis
-dbt test: Completed with 21 passed
+dbt deps: Installing dbt-labs/dbt_utils (1.3.0)
+
+dbt test: Found 53 tests, 6 sources, 0 models
+          Concurrency: 1 threads (target='dev')
+          Finished running 53 tests
+          Completed successfully
+          PASS=53 WARN=0 ERROR=0 SKIP=0 TOTAL=53
 ```
 
 ---

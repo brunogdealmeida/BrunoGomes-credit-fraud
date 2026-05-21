@@ -224,7 +224,7 @@ services:
     environment:
       DREMIO_JAVA_SERVER_EXTRA_OPTS: >-
         -Dpaths.dist=file:///opt/dremio/data/dist
-        -Xmx2g
+        -Xmx1500m
         -Xms512m
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9047 || exit 1"]
@@ -314,6 +314,132 @@ services:
     networks:
       - lakehouse-net
 
+  # ─── OpenMetadata (Data Governance) ─────────────────────────────────────────
+  # openmetadata/db ships MySQL 8 with the OM schema pre-loaded.
+  # openmetadata-search is single-node Elasticsearch with security disabled.
+  # openmetadata-server bootstraps on first start (~60 s) then serves on 8585.
+  # openmetadata-setup runs metadata ingestion for Dremio, Airflow, and MinIO.
+
+  openmetadata-db:
+    image: openmetadata/db:1.5.0
+    container_name: openmetadata-db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${OPENMETADATA_MYSQL_ROOT_PASSWORD:-om_root_pass}
+    volumes:
+      - openmetadata-db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "--silent"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - lakehouse-net
+
+  openmetadata-search:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.10.2
+    container_name: openmetadata-search
+    environment:
+      discovery.type: single-node
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      xpack.security.enabled: "false"
+    volumes:
+      - openmetadata-search-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - lakehouse-net
+
+  openmetadata-server:
+    image: openmetadata/server:1.5.0
+    container_name: openmetadata-server
+    ports:
+      - "8585:8585"
+      - "8586:8586"
+    depends_on:
+      openmetadata-db:
+        condition: service_healthy
+      openmetadata-search:
+        condition: service_healthy
+    environment:
+      # Server
+      OPENMETADATA_CLUSTER_NAME: openmetadata
+      SERVER_PORT: "8585"
+      SERVER_ADMIN_PORT: "8586"
+      LOG_LEVEL: INFO
+      # MySQL backend (pre-configured inside openmetadata/db image)
+      DB_DRIVER_CLASS: com.mysql.cj.jdbc.Driver
+      DB_SCHEME: mysql
+      DB_USE_SSL: "false"
+      DB_USER: openmetadata_user
+      DB_USER_PASSWORD: openmetadata_password
+      DB_HOST: openmetadata-db
+      DB_PORT: "3306"
+      OM_DATABASE: openmetadata_db
+      # Elasticsearch
+      SEARCH_TYPE: elasticsearch
+      ELASTICSEARCH_HOST: openmetadata-search
+      ELASTICSEARCH_PORT: "9200"
+      ELASTICSEARCH_SCHEME: http
+      ELASTICSEARCH_CONNECTION_TIMEOUT_SECS: "5"
+      ELASTICSEARCH_SOCKET_TIMEOUT_SECS: "60"
+      ELASTICSEARCH_BATCH_SIZE: "10"
+      # Airflow pipeline client
+      PIPELINE_SERVICE_CLIENT_ENDPOINT: "http://airflow-webserver:8080"
+      PIPELINE_SERVICE_CLIENT_VERIFY_SSL: "no-ssl"
+      # Authentication — basic (username + password, no external IdP)
+      AUTHENTICATION_PROVIDER: basic
+      JWT_ISSUER: open-metadata.org
+      JWT_KEY_ID: Gb389a-9f76-gdjs-a92j-0242bk94356
+      RSA_PUBLIC_KEY_FILE_PATH: /opt/openmetadata/conf/public_key.der
+      RSA_PRIVATE_KEY_FILE_PATH: /opt/openmetadata/conf/private_key.der
+    # Entrypoint is /bin/bash; CMD args become its arguments.
+    # Pass -c so the shell executes the migration then starts the server.
+    command:
+      - -c
+      - "./bootstrap/openmetadata-ops.sh migrate && /openmetadata-start.sh"
+    healthcheck:
+      # Accept 200 or 401 — both mean the server is up and responding
+      test: ["CMD-SHELL", "wget --server-response -qO /dev/null http://localhost:8585/api/v1/system/status 2>&1 | grep -q 'HTTP/'"]
+      interval: 30s
+      timeout: 15s
+      retries: 20
+      start_period: 120s
+    networks:
+      - lakehouse-net
+
+  openmetadata-setup:
+    image: openmetadata/ingestion:1.5.0
+    container_name: openmetadata-setup
+    depends_on:
+      openmetadata-server:
+        condition: service_healthy
+    environment:
+      OM_HOST: openmetadata-server
+      OM_PORT: "8585"
+      OM_ADMIN_EMAIL: admin@openmetadata.org
+      OM_ADMIN_PASSWORD: ${OPENMETADATA_ADMIN_PASSWORD:-admin}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./openmetadata/ingestion:/openmetadata/ingestion:ro
+    entrypoint: ["python", "/scripts/setup_openmetadata.py"]
+    restart: "no"
+    networks:
+      - lakehouse-net
+
   # ─── Monitoring ──────────────────────────────────────────────────────────────
 
   prometheus:
@@ -377,6 +503,16 @@ services:
     networks:
       - lakehouse-net
 
+  dbt-docs:
+    image: nginx:alpine
+    container_name: dbt-docs
+    ports:
+      - "18080:80"
+    volumes:
+      - ./dbt/target:/usr/share/nginx/html:ro
+    networks:
+      - lakehouse-net
+
 volumes:
   minio-data:
   postgres-data:
@@ -384,6 +520,9 @@ volumes:
   airflow-logs:
   prometheus-data:
   grafana-data:
+  openmetadata-db-data:
+  openmetadata-search-data:
+  openmetadata-data:
 
 networks:
   lakehouse-net:

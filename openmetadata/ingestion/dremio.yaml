@@ -1,0 +1,34 @@
+source:
+  type: dremio
+  serviceName: dremio_lakehouse
+  serviceConnection:
+    config:
+      type: Dremio
+      username: "${DREMIO_USERNAME}"
+      password: "${DREMIO_PASSWORD}"
+      hostPort: "dremio:9047"
+      databaseName: nessie_lakehouse
+  sourceConfig:
+    config:
+      type: DatabaseMetadata
+      markDeletedTables: false
+      includeTags: true
+      includeViews: false
+      schemaFilterPattern:
+        includes:
+          - "nessie_lakehouse\\.bronze"
+          - "nessie_lakehouse\\.silver"
+          - "nessie_lakehouse\\.quarantine"
+          - "nessie_lakehouse\\.gold"
+
+sink:
+  type: metadata-rest
+  config: {}
+
+workflowConfig:
+  loggerLevel: INFO
+  openMetadataServerConfig:
+    hostPort: "http://openmetadata-server:8585/api"
+    authProvider: openmetadata
+    securityConfig:
+      jwtToken: "${OM_JWT_TOKEN}"

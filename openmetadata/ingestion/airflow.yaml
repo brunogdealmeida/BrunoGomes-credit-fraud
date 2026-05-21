@@ -1,0 +1,33 @@
+source:
+  type: airflow
+  serviceName: airflow_lakehouse
+  serviceConnection:
+    config:
+      type: Airflow
+      hostPort: "http://airflow-webserver:8080"
+      numberOfStatus: 10
+      # connection points to Airflow's Postgres metadata database
+      connection:
+        type: Postgres
+        username: "${POSTGRES_USER}"
+        authType:
+          password: "${POSTGRES_PASSWORD}"
+        hostPort: "postgres:5432"
+        database: "${POSTGRES_DB}"
+  sourceConfig:
+    config:
+      type: PipelineMetadata
+      includeLineage: true
+      markDeletedPipelines: false
+
+sink:
+  type: metadata-rest
+  config: {}
+
+workflowConfig:
+  loggerLevel: INFO
+  openMetadataServerConfig:
+    hostPort: "http://openmetadata-server:8585/api"
+    authProvider: openmetadata
+    securityConfig:
+      jwtToken: "${OM_JWT_TOKEN}"

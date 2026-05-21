@@ -34,8 +34,16 @@ CSV Dataset
            nessie_lakehouse.gold.*
               │
               ▼
-           Apache Superset                  Dashboard
+           Apache Superset                  Dashboard / BI
            Fraud Detection Analytics
+              │
+              ▼
+           OpenMetadata                     Data Catalog / Governance
+           MinIO + Airflow lineage
+              │
+              ▼
+       Prometheus + Grafana                 Monitoring / Observability
+       Container & Postgres metrics
 ```
 
 ## Dataset
@@ -60,20 +68,24 @@ CSV Dataset
 
 ## Services
 
-| Service        | URL                         | Credentials              |
-|----------------|-----------------------------|--------------------------|
-| MinIO Console  | http://localhost:9001       | admin / password123      |
-| Nessie API     | http://localhost:19120/api/v1 | —                       |
-| Spark UI       | http://localhost:8080       | —                        |
-| Airflow UI     | http://localhost:8082       | admin / admin123         |
-| Dremio UI      | http://localhost:9047       | admin / Admin1234!       |
-| Superset UI    | http://localhost:8088       | admin / admin123         |
+| Service           | URL                           | Credentials               |
+|-------------------|-------------------------------|---------------------------|
+| Airflow UI        | http://localhost:8082         | admin / admin123          |
+| Dremio UI         | http://localhost:9047         | see `.env`                |
+| MinIO Console     | http://localhost:9001         | see `.env`                |
+| Superset UI       | http://localhost:8088         | admin / admin123          |
+| OpenMetadata UI   | http://localhost:8585         | admin@openmetadata.org / admin |
+| Grafana           | http://localhost:3001         | admin / admin             |
+| Prometheus        | http://localhost:9090         | —                         |
+| Nessie API        | http://localhost:19120/api/v1 | —                         |
+| Spark Master UI   | http://localhost:8080         | —                         |
 
 ## Quick Start
 
 ### Prerequisites
-- Docker Desktop ≥ 24 with ≥ 12 GB RAM allocated
+- Docker Desktop ≥ 24 with **≥ 12 GB RAM allocated** (Settings → Resources → Memory)
 - Docker Compose v2
+- ≥ 30 GB free disk space (Spark work artifacts accumulate — see Operational Notes)
 
 ### 1. Start the stack
 
@@ -110,7 +122,10 @@ gold_aggregation        Aggregate → 5 Gold tables:
       │                   daily_fraud_metrics, high_risk_transactions,
       │                   risk_profile
       │
-dbt_quality_tests       Run schema + value tests on Silver via Dremio
+dbt_quality_tests       53 tests against Spark-produced Iceberg tables via Dremio
+                        Silver: not_null + accepted_values on all 8 columns
+                        Gold: not_null + accepted_values + range checks on all 5 tables
+                        dbt materializes nothing — pure quality gate
 ```
 
 ## Iceberg Tables
@@ -143,13 +158,23 @@ If it fails, add it manually in the Dremio UI:
 
 ## dbt Quality Tests
 
-Tests run against Nessie Iceberg tables via Dremio:
+dbt is a **pure quality gate** — it materializes no models. All 53 tests run directly against the Spark-produced Iceberg tables (`nessie_lakehouse.silver.*` and `nessie_lakehouse.gold.*`) via Dremio as the SQL engine.
 
 ```bash
 make dbt-test    # run tests standalone
 ```
 
-Tests include: `not_null`, `accepted_values` for all critical Silver columns.
+Test coverage: `not_null` and `accepted_values` on Silver; `not_null`, `accepted_values`, and `dbt_utils.accepted_range` on all 5 Gold tables.
+
+## Monitoring
+
+- **Grafana** (http://localhost:3001) — dashboards for container and Postgres metrics
+- **Prometheus** (http://localhost:9090) — metrics collection from cAdvisor and postgres-exporter
+- **cAdvisor** — container resource metrics (CPU, memory, disk per container)
+
+## Data Catalog
+
+- **OpenMetadata** (http://localhost:8585) — automated ingestion of MinIO storage metadata and Airflow pipeline lineage via the `openmetadata-setup` init container.
 
 ## Useful Commands
 
@@ -159,3 +184,25 @@ make status     # show container health
 make clean      # remove all volumes (resets all data)
 make urls       # print all service URLs
 ```
+
+## Operational Notes
+
+### Spark work directory disk usage
+
+Spark writes job artifacts to `/opt/spark/work` inside the `spark-worker` container. Each pipeline run accumulates ~400 MB; after ~60 runs this can consume 25+ GB and cause "No space left on device" errors.
+
+Clean up when needed:
+
+```bash
+docker exec spark-worker sh -c "cd /opt/spark/work && for d in app-2*; do rm -rf \"\$d\"; done"
+```
+
+### Dremio OOM under memory pressure
+
+Dremio is configured with `-Xmx1500m`. During active Spark jobs the Docker VM can run low on memory and OOMKill Dremio. The pipeline design mitigates this: Spark jobs complete first and Dremio is only needed for the `dbt_quality_tests` step at the end.
+
+If Dremio is killed, restart it: `docker compose up -d dremio`
+
+### Stale Nessie catalog after direct MinIO deletion
+
+Deleting files directly from MinIO (bypassing Spark/Iceberg) leaves orphaned metadata in Nessie, causing `NotFoundException` on the next pipeline run. Always drop tables via Spark SQL or re-run ingestion with `overwrite` mode rather than deleting MinIO folders manually.

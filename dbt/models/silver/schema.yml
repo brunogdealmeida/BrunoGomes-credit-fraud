@@ -1,6 +1,0 @@
-version: 2
-
-models: []
-
-# Silver quality is tested directly on the source table via sources.yml.
-# No dbt models are materialized in the silver/ directory — Spark owns those tables.

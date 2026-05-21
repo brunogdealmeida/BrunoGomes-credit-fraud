@@ -1,0 +1,29 @@
+source:
+  type: s3
+  serviceName: minio_lakehouse
+  serviceConnection:
+    config:
+      type: S3
+      awsConfig:
+        awsAccessKeyId: "${MINIO_ROOT_USER}"
+        awsSecretAccessKey: "${MINIO_ROOT_PASSWORD}"
+        awsRegion: us-east-1
+        endPointURL: "http://minio:9000"
+  sourceConfig:
+    config:
+      type: StorageMetadata
+      containerFilterPattern:
+        includes:
+          - "lakehouse"
+
+sink:
+  type: metadata-rest
+  config: {}
+
+workflowConfig:
+  loggerLevel: INFO
+  openMetadataServerConfig:
+    hostPort: "http://openmetadata-server:8585/api"
+    authProvider: openmetadata
+    securityConfig:
+      jwtToken: "${OM_JWT_TOKEN}"
