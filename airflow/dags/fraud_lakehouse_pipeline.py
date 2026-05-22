@@ -111,12 +111,21 @@ with DAG(
         **SPARK_SUBMIT_KWARGS,
     )
 
+    quality_report = SparkSubmitOperator(
+        task_id="silver_quality_report",
+        application="/opt/airflow/jobs/silver_quality_report.py",
+        application_args=["df_fraud_credit.csv"],
+        name="silver_quality_report",
+        **SPARK_SUBMIT_KWARGS,
+    )
+
     dbt_tests = BashOperator(
         task_id="dbt_quality_tests",
         bash_command="""
             set -e
             cd /opt/dbt
             dbt deps --profiles-dir /opt/dbt
+            dbt run --select bronze --profiles-dir /opt/dbt --target dev
             dbt test --profiles-dir /opt/dbt --target dev
             dbt docs generate --profiles-dir /opt/dbt --target dev
         """,
@@ -128,4 +137,4 @@ with DAG(
         append_env=True,
     )
 
-    bronze >> silver >> gold >> dbt_tests
+    bronze >> silver >> [gold, quality_report] >> dbt_tests

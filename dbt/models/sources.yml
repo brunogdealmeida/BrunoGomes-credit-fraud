@@ -2,6 +2,51 @@ version: 2
 
 sources:
 
+  # ── Bronze layer ──────────────────────────────────────────────────────────────
+  # Raw ingested records — intentionally pre-validation, no source tests.
+  # Quality is measured by the bronze_quality_report and bronze_quality_distributions models.
+
+  - name: bronze
+    description: "Raw ingested records (Spark CSV → Iceberg, Nessie catalog) — pre-validation"
+    database: nessie_lakehouse
+    schema: bronze
+    tables:
+      - name: tb_fraud_credit
+        description: "Raw fraud transaction records as ingested from CSV before quarantine split"
+        columns:
+          - name: timestamp
+            description: "Unix epoch timestamp (seconds)"
+          - name: sending_address
+            description: "Sender wallet/account address"
+          - name: receiving_address
+            description: "Receiver wallet/account address"
+          - name: amount
+            description: "Transaction amount (may be invalid)"
+          - name: transaction_type
+            description: "Type of transaction (raw, may contain invalid values)"
+          - name: location_region
+            description: "Geographic region (raw, may contain invalid values)"
+          - name: anomaly
+            description: "Risk label (raw, may contain invalid values)"
+          - name: risk_score
+            description: "Numeric risk score (raw, may be out of 0–100 range)"
+          - name: login_frequency
+            description: "Login frequency count"
+          - name: session_duration
+            description: "Session duration in seconds"
+          - name: purchase_pattern
+            description: "Purchase pattern category"
+          - name: age_group
+            description: "User age group"
+          - name: ip_prefix
+            description: "IP address prefix"
+          - name: _ingestion_time
+            description: "Spark ingestion timestamp"
+          - name: _source_file
+            description: "Source CSV file name"
+          - name: _batch_id
+            description: "Ingestion batch identifier"
+
   # ── Silver layer ─────────────────────────────────────────────────────────────
   # Written by Spark silver_transformation.py into Iceberg via Nessie.
   # dbt uses Dremio as the SQL engine to query these tables directly.
@@ -184,3 +229,48 @@ sources:
               - dbt_utils.accepted_range:
                   min_value: 0
                   max_value: 100
+
+      - name: region_risk_ranking
+        description: "All regions ranked by overall average risk score (descending)"
+        columns:
+          - name: location_region
+            tests:
+              - not_null
+              - accepted_values:
+                  values: ["Africa", "Asia", "Europe", "North America", "South America"]
+          - name: transaction_count
+            tests:
+              - not_null
+              - dbt_utils.accepted_range:
+                  min_value: 1
+          - name: avg_risk_score
+            tests:
+              - not_null
+              - dbt_utils.accepted_range:
+                  min_value: 0
+                  max_value: 100
+          - name: min_risk_score
+            tests:
+              - not_null
+              - dbt_utils.accepted_range:
+                  min_value: 0
+                  max_value: 100
+          - name: max_risk_score
+            tests:
+              - not_null
+              - dbt_utils.accepted_range:
+                  min_value: 0
+                  max_value: 100
+
+      - name: top_sale_receivers
+        description: "Top 3 receiving addresses by amount from their most recent sale transaction"
+        columns:
+          - name: receiving_address
+            tests: [not_null]
+          - name: amount
+            tests:
+              - not_null
+              - dbt_utils.accepted_range:
+                  min_value: 0
+          - name: timestamp
+            tests: [not_null]

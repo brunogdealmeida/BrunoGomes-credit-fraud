@@ -95,6 +95,25 @@ def source_exists(session: requests.Session, name: str) -> bool:
     return r.status_code == 200
 
 
+def create_dbt_folder(session: requests.Session, username: str) -> None:
+    """Create the @<username>/dbt_quality folder used by dbt table materializations."""
+    folder_path = f"@{username}/dbt_quality"
+    r = session.get(f"{BASE_URL}/api/v3/catalog/by-path/{folder_path}", timeout=10)
+    if r.status_code == 200:
+        print(f"[dremio-setup] Folder '{folder_path}' already exists — skipping")
+        return
+
+    payload = {"entityType": "folder", "path": [f"@{username}", "dbt_quality"]}
+    r = session.post(f"{BASE_URL}/api/v3/catalog", json=payload, timeout=15)
+    if r.status_code in (200, 201):
+        print(f"[dremio-setup] Folder '{folder_path}' created successfully")
+    else:
+        print(
+            f"[dremio-setup] WARNING: Could not create folder '{folder_path}' "
+            f"({r.status_code}): {r.text[:200]}"
+        )
+
+
 def create_nessie_source(session: requests.Session) -> None:
     if source_exists(session, "nessie_lakehouse"):
         print("[dremio-setup] Source 'nessie_lakehouse' already exists — skipping")
@@ -182,6 +201,7 @@ def main() -> None:
     })
 
     create_nessie_source(session)
+    create_dbt_folder(session, USERNAME)
 
     print(f"\n[dremio-setup] Done — Dremio UI: {BASE_URL}")
     print(f"  Username: {USERNAME}  |  Password: {PASSWORD}")

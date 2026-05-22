@@ -11,6 +11,9 @@ macro-paths: ["macros"]
 target-path: "target"
 clean-targets: ["target", "dbt_packages"]
 
-# dbt is a quality gate only — no models are materialized.
-# All tests run against Spark-produced Iceberg tables via Dremio.
-models: {}
+# Bronze quality models are materialized as tables in Dremio (@admin.dbt_quality.*).
+# Silver and gold remain test-only — no SQL models in those folders.
+models:
+  fraud_lakehouse:
+    bronze:
+      +materialized: table

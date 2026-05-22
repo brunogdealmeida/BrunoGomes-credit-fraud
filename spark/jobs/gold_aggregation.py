@@ -14,9 +14,11 @@ from pyspark.sql.functions import (
     max as _max,
     min as _min,
     round as _round,
+    row_number,
     sum as _sum,
     when,
 )
+from pyspark.sql.window import Window
 
 from config import SparkConfig, load_spark_config, load_table_config
 
@@ -92,7 +94,46 @@ def main() -> None:
 
     spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.gold")
 
-    # ── 1. Fraud summary by region ────────────────────────────────────────────
+
+    # ── 6. Region risk ranking ────────────────────────────────────────────────
+    # All regions ordered by overall avg risk score descending.
+    logger.info("Building region_risk_ranking")
+    region_risk_ranking = (
+        silver
+        .groupBy("location_region")
+        .agg(
+            count("*").alias("transaction_count"),
+            _round(avg("risk_score"), 2).alias("avg_risk_score"),
+            _round(_min("risk_score"), 2).alias("min_risk_score"),
+            _round(_max("risk_score"), 2).alias("max_risk_score"),
+        )
+        .orderBy(col("avg_risk_score").desc())
+        .withColumn("_created_at", current_timestamp())
+    )
+    write_gold(region_risk_ranking, spark, "region_risk_ranking")
+
+    # ── 7. Top 3 sale receivers ───────────────────────────────────────────────
+    # For each receiving_address, take only its most recent "sale" transaction,
+    # then return the top 3 by amount.
+    logger.info("Building top_sale_receivers")
+    sale_window = Window.partitionBy("receiving_address").orderBy(col("timestamp").desc())
+    top_sale_receivers = (
+        silver
+        .filter(col("transaction_type") == "sale")
+        .withColumn("_rn", row_number().over(sale_window))
+        .filter(col("_rn") == 1)
+        .orderBy(col("amount").desc())
+        .limit(3)
+        .select(
+            "receiving_address",
+            _round("amount", 2).alias("amount"),
+            "timestamp",
+        )
+        .withColumn("_created_at", current_timestamp())
+    )
+    write_gold(top_sale_receivers, spark, "top_sale_receivers")
+
+    # ── 3. Fraud summary by region ────────────────────────────────────────────
     logger.info("Building fraud_by_region")
     fraud_by_region = (
         silver
@@ -109,7 +150,7 @@ def main() -> None:
     )
     write_gold(fraud_by_region, spark, "fraud_by_region")
 
-    # ── 2. Transaction stats by type ──────────────────────────────────────────
+    # ── 4. Transaction stats by type ──────────────────────────────────────────
     logger.info("Building fraud_by_type")
     fraud_by_type = (
         silver
@@ -125,7 +166,7 @@ def main() -> None:
     )
     write_gold(fraud_by_type, spark, "fraud_by_type")
 
-    # ── 3. Daily fraud metrics ────────────────────────────────────────────────
+    # ── 5. Daily fraud metrics ────────────────────────────────────────────────
     logger.info("Building daily_fraud_metrics")
     daily_metrics = (
         silver
@@ -143,7 +184,7 @@ def main() -> None:
     )
     write_gold(daily_metrics, spark, "daily_fraud_metrics")
 
-    # ── 4. High-risk transactions ─────────────────────────────────────────────
+    # ── 6. High-risk transactions ─────────────────────────────────────────────
     logger.info("Building high_risk_transactions  filter=(anomaly=high_risk OR risk_score>=75)")
     high_risk = (
         silver
@@ -170,7 +211,7 @@ def main() -> None:
     )
     write_gold(high_risk, spark, "high_risk_transactions")
 
-    # ── 5. Risk profile by user segment ──────────────────────────────────────
+    # ── 7. Risk profile by user segment ──────────────────────────────────────
     logger.info("Building risk_profile")
     risk_profile = (
         silver
@@ -191,7 +232,8 @@ def main() -> None:
     silver.unpersist()
     logger.info(
         "Gold aggregation complete  source=%s  "
-        "tables=[fraud_by_region, fraud_by_type, daily_fraud_metrics, high_risk_transactions, risk_profile]",
+        "tables=[fraud_by_region, fraud_by_type, daily_fraud_metrics, high_risk_transactions, "
+        "risk_profile, region_risk_ranking, top_sale_receivers]",
         silver_table,
     )
     spark.stop()

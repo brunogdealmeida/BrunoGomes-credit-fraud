@@ -215,6 +215,7 @@ services:
   dremio:
     image: dremio/dremio-oss:24.3.0
     container_name: dremio
+    restart: on-failure
     ports:
       - "9047:9047"   # REST API + UI
       - "31010:31010" # JDBC/ODBC

@@ -1,0 +1,77 @@
+version: 2
+
+models:
+  - name: bronze_quality_report
+    description: >
+      Per-check quality results for the bronze layer.
+      One row per check: 13 completeness checks (null counts per column)
+      and 6 validity checks (domain rules + duplicate detection).
+      Materialized as a table in Dremio so results are pre-computed.
+    columns:
+      - name: check_type
+        description: "Category: completeness or validity"
+        tests: [not_null]
+      - name: check_name
+        description: "Unique check identifier (e.g. null_timestamp, amount_positive)"
+        tests: [not_null, unique]
+      - name: description
+        description: "Human-readable description of what the check validates"
+        tests: [not_null]
+      - name: error_count
+        description: "Number of records failing this check"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+      - name: total_records
+        description: "Total records scanned"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1
+      - name: error_pct
+        description: "Percentage of records failing this check (0–100)"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 100
+      - name: conformance_pct
+        description: "Percentage of records passing this check (0–100)"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 100
+      - name: status
+        description: "PASS if error_count = 0, FAIL otherwise"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["PASS", "FAIL"]
+
+  - name: bronze_quality_distributions
+    description: >
+      Value frequency distributions for categorical columns and risk score bands
+      in the bronze layer. Covers: anomaly, transaction_type, location_region,
+      age_group, purchase_pattern, and risk_score_band.
+    columns:
+      - name: dimension
+        description: "Column name (anomaly, transaction_type, location_region, age_group, purchase_pattern, risk_score_band)"
+        tests: [not_null]
+      - name: dim_value
+        description: "Observed value, or [NULL] for missing entries"
+        tests: [not_null]
+      - name: record_count
+        description: "Number of records with this dimension/value combination"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 1
+      - name: pct
+        description: "Percentage of total records"
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 100
